@@ -1,0 +1,19 @@
+{
+  "name": "סיכום פגישות טיפוליות",
+  "short_name": "סיכומי טיפול",
+  "description": "PWA אישי להקלטה, עיבוד וניהול דוחות פגישה טיפולית בעברית.",
+  "lang": "he",
+  "dir": "rtl",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#1d4ed8",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

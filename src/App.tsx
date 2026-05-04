@@ -1,0 +1,876 @@
+import { useMemo, useRef, useState } from "react";
+import {
+  AlignmentType,
+  Document,
+  HeadingLevel,
+  Packer,
+  Paragraph,
+  TextRun
+} from "docx";
+import {
+  CalendarDays,
+  ClipboardCopy,
+  FileAudio,
+  FileText,
+  LogIn,
+  Mic,
+  Pause,
+  Play,
+  Save,
+  Search,
+  Send,
+  Share2,
+  Square,
+  Trash2,
+  UserRound,
+  UsersRound
+} from "lucide-react";
+import { v4 as uuid } from "uuid";
+import { askSessionQuestion, processAudioDraft } from "./ai";
+import {
+  getStoredAccessToken,
+  isGoogleConfigured,
+  loadTherapyDataFromDrive,
+  signInWithGoogle,
+  syncTherapyDataToDrive,
+  uploadSessionDocxToDrive
+} from "./googleDrive";
+import { deletePendingAudio, savePendingAudio } from "./offlineAudio";
+import { storage } from "./storage";
+import type { Patient, SessionReport, TherapySession } from "./types";
+
+type View = "login" | "home" | "patients" | "patient" | "new-recording" | "new-upload" | "session";
+
+const emptyReport: SessionReport = {
+  title: "דו״ח סיכום פגישה טיפולית",
+  meetingTopic: "",
+  sessionNarrative: "",
+  therapeuticInsights: "",
+  followUpPoints: [],
+  administrativeNotes: "",
+  crmSummary: ""
+};
+
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function timeNow() {
+  return new Date().toTimeString().slice(0, 5);
+}
+
+function createPatient(displayName: string, ownerUserId: string): Patient {
+  const now = new Date().toISOString();
+  return {
+    patientId: uuid(),
+    ownerUserId,
+    displayName,
+    optionalDetails: {
+      fullName: "",
+      phone: "",
+      age: "",
+      treatmentStatus: "",
+      generalNotes: ""
+    },
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+function createSession(params: {
+  patient: Patient;
+  therapistName: string;
+  sourceType: "recording" | "upload";
+  sessionDate: string;
+  sessionStartTime: string;
+  participants: string;
+  sessionType: string;
+}): TherapySession {
+  const now = new Date().toISOString();
+  return {
+    sessionId: uuid(),
+    ownerUserId: params.patient.ownerUserId,
+    patientId: params.patient.patientId,
+    patientDisplayName: params.patient.displayName,
+    therapistName: params.therapistName,
+    sessionDate: params.sessionDate,
+    sessionStartTime: params.sessionStartTime,
+    sessionType: params.sessionType,
+    participants: params.participants,
+    durationMinutes: null,
+    price: null,
+    sourceType: params.sourceType,
+    audioStored: false,
+    processingStatus: "draft",
+    report: emptyReport,
+    internalSessionMemory: {
+      factsFromSession: [],
+      aiInterpretations: [],
+      interventions: [],
+      riskOrUncertaintyNotes: [],
+      openQuestionsForNextSession: []
+    },
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+export function App() {
+  const [user, setUser] = useState(storage.getUser());
+  const [isSignedIn, setIsSignedIn] = useState(Boolean(localStorage.getItem("therapy:signed-in")));
+  const [googleAccessToken, setGoogleAccessToken] = useState(getStoredAccessToken());
+  const [appMessage, setAppMessage] = useState("");
+  const [patients, setPatients] = useState(storage.getPatients());
+  const [sessions, setSessions] = useState(storage.getSessions());
+  const [view, setView] = useState<View>(isSignedIn ? "home" : "login");
+  const [selectedPatientId, setSelectedPatientId] = useState<string | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [nameQuery, setNameQuery] = useState("");
+  const [dateQuery, setDateQuery] = useState("");
+
+  const selectedPatient = patients.find((patient) => patient.patientId === selectedPatientId) || null;
+  const selectedSession = sessions.find((session) => session.sessionId === selectedSessionId) || null;
+
+  function syncToDrive(nextPatients: Patient[], nextSessions: TherapySession[]) {
+    if (!googleAccessToken) return;
+    syncTherapyDataToDrive({
+      accessToken: googleAccessToken,
+      patients: nextPatients,
+      sessions: nextSessions
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : "שגיאת סנכרון Google Drive";
+      setAppMessage(message);
+    });
+  }
+
+  function persistPatients(next: Patient[]) {
+    setPatients(next);
+    storage.savePatients(next);
+    syncToDrive(next, sessions);
+  }
+
+  function persistSessions(next: TherapySession[]) {
+    setSessions(next);
+    storage.saveSessions(next);
+    syncToDrive(patients, next);
+  }
+
+  async function signIn() {
+    try {
+      if (isGoogleConfigured()) {
+        const result = await signInWithGoogle();
+        setGoogleAccessToken(result.accessToken);
+        setUser(result.user);
+        storage.saveUser(result.user);
+        localStorage.setItem("therapy:signed-in", "true");
+        setAppMessage("התחברת עם Google. הנתונים יסונכרנו ל-Drive אחרי שמירה.");
+      } else {
+        const nextUser = { ...user, displayName: user.displayName || "מטפל/ת" };
+        setUser(nextUser);
+        storage.saveUser(nextUser);
+        localStorage.setItem("therapy:signed-in", "true");
+        setAppMessage("מצב דמו פעיל. כדי להתחבר ל-Google צריך להוסיף VITE_GOOGLE_CLIENT_ID לקובץ .env.");
+      }
+      setIsSignedIn(true);
+      setView("home");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "הכניסה עם Google נכשלה";
+      setAppMessage(message);
+    }
+  }
+
+  async function connectGoogleDrive() {
+    try {
+      const result = await signInWithGoogle();
+      setGoogleAccessToken(result.accessToken);
+      setUser(result.user);
+      storage.saveUser(result.user);
+      localStorage.setItem("therapy:signed-in", "true");
+      setIsSignedIn(true);
+      setAppMessage("Google Drive חובר. טוען נתונים מה-Drive...");
+      const remote = await loadTherapyDataFromDrive(result.accessToken);
+      const mergedPatients = mergePatients(remote.patients, patients);
+      const mergedSessions = mergeSessions(remote.sessions, sessions);
+      setPatients(mergedPatients);
+      setSessions(mergedSessions);
+      storage.savePatients(mergedPatients);
+      storage.saveSessions(mergedSessions);
+      await syncTherapyDataToDrive({
+        accessToken: result.accessToken,
+        patients: mergedPatients,
+        sessions: mergedSessions
+      });
+      setAppMessage("Google Drive חובר. הנתונים נטענו וסונכרנו.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "חיבור Google Drive נכשל";
+      setAppMessage(message);
+    }
+  }
+
+  function upsertSession(session: TherapySession) {
+    persistSessions([session, ...sessions.filter((item) => item.sessionId !== session.sessionId)]);
+    setSelectedSessionId(session.sessionId);
+  }
+
+  function deleteSession(sessionId: string) {
+    persistSessions(sessions.filter((session) => session.sessionId !== sessionId));
+    setSelectedSessionId(null);
+    setView("home");
+  }
+
+  function deletePatient(patientId: string) {
+    persistPatients(patients.filter((patient) => patient.patientId !== patientId));
+    persistSessions(sessions.filter((session) => session.patientId !== patientId));
+    setSelectedPatientId(null);
+    setView("patients");
+  }
+
+  const filteredSessions = useMemo(() => {
+    return sessions.filter((session) => {
+      const byName = nameQuery ? session.patientDisplayName.includes(nameQuery) : true;
+      const byDate = dateQuery ? session.sessionDate === dateQuery : true;
+      return byName && byDate;
+    });
+  }, [dateQuery, nameQuery, sessions]);
+
+  if (!isSignedIn || view === "login") {
+    return (
+      <main className="login-shell">
+        <section className="login-panel">
+          <div className="brand-mark">
+            <FileText />
+          </div>
+          <h1>סיכום פגישות טיפוליות</h1>
+          <p>מערכת אישית בעברית להקלטה, עיבוד, עריכה וניהול דוחות טיפוליים.</p>
+          {appMessage && <p className="warning">{appMessage}</p>}
+          <button className="primary-button" onClick={signIn}>
+            <LogIn />
+            כניסה עם Google
+          </button>
+          <span className="small-note">
+            {isGoogleConfigured()
+              ? "הכניסה תבקש הרשאת Drive מצומצמת מסוג drive.file."
+              : "עד הוספת Google Client ID, הכניסה תפעל במצב דמו מקומי."}
+          </span>
+        </section>
+      </main>
+    );
+  }
+
+  return (
+    <main className="app-shell">
+      <header className="topbar">
+        <button className="ghost-button" onClick={() => setView("home")}>
+          <FileText />
+          סיכומי טיפול
+        </button>
+        <div className="user-chip">
+          <UserRound />
+          <span>{user.displayName}</span>
+        </div>
+        {isGoogleConfigured() && !googleAccessToken && (
+          <button className="secondary-button" onClick={connectGoogleDrive}>
+            <Save />
+            חבר Google Drive
+          </button>
+        )}
+        {googleAccessToken && <span className="drive-chip">Drive מחובר</span>}
+      </header>
+      {appMessage && <div className="app-message">{appMessage}</div>}
+
+      {view === "home" && (
+        <section className="page-grid">
+          <div className="action-strip">
+            <button className="primary-button" onClick={() => setView("new-recording")}>
+              <Mic />
+              הקלט פגישה חדשה
+            </button>
+            <button className="secondary-button" onClick={() => setView("new-upload")}>
+              <FileAudio />
+              העלה קובץ אודיו
+            </button>
+            <button className="secondary-button" onClick={() => setView("patients")}>
+              <UsersRound />
+              מטופלים
+            </button>
+          </div>
+
+          <section className="toolbar">
+            <label>
+              <Search />
+              <input value={nameQuery} onChange={(event) => setNameQuery(event.target.value)} placeholder="חיפוש לפי שם מטופל" />
+            </label>
+            <label>
+              <CalendarDays />
+              <input type="date" value={dateQuery} onChange={(event) => setDateQuery(event.target.value)} />
+            </label>
+          </section>
+
+          <SessionList
+            title="פגישות אחרונות"
+            sessions={filteredSessions}
+            onOpen={(sessionId) => {
+              setSelectedSessionId(sessionId);
+              setView("session");
+            }}
+          />
+        </section>
+      )}
+
+      {view === "patients" && (
+        <PatientsView
+          patients={patients}
+          sessions={sessions}
+          onCreate={(displayName) => {
+            const patient = createPatient(displayName, user.userId);
+            persistPatients([patient, ...patients]);
+            setSelectedPatientId(patient.patientId);
+            setView("patient");
+          }}
+          onOpen={(patientId) => {
+            setSelectedPatientId(patientId);
+            setView("patient");
+          }}
+        />
+      )}
+
+      {view === "patient" && selectedPatient && (
+        <PatientView
+          patient={selectedPatient}
+          sessions={sessions.filter((session) => session.patientId === selectedPatient.patientId)}
+          onBack={() => setView("patients")}
+          onSave={(patient) => persistPatients(patients.map((item) => (item.patientId === patient.patientId ? patient : item)))}
+          onDelete={() => deletePatient(selectedPatient.patientId)}
+          onOpenSession={(sessionId) => {
+            setSelectedSessionId(sessionId);
+            setView("session");
+          }}
+        />
+      )}
+
+      {(view === "new-recording" || view === "new-upload") && (
+        <NewSessionView
+          mode={view === "new-recording" ? "recording" : "upload"}
+          userName={user.displayName}
+          patients={patients}
+          onCancel={() => setView("home")}
+          onCreatePatient={(displayName) => {
+            const patient = createPatient(displayName, user.userId);
+            persistPatients([patient, ...patients]);
+            return patient;
+          }}
+          onSaved={(session) => {
+            upsertSession(session);
+            setView("session");
+          }}
+        />
+      )}
+
+      {view === "session" && selectedSession && (
+        <SessionView
+          session={selectedSession}
+          previousSessions={sessions.filter(
+            (session) => session.patientId === selectedSession.patientId && session.sessionId !== selectedSession.sessionId
+          )}
+          onBack={() => setView("home")}
+          onDelete={() => deleteSession(selectedSession.sessionId)}
+          onSave={(session) => upsertSession(session)}
+        />
+      )}
+    </main>
+  );
+}
+
+function mergePatients(primary: Patient[], secondary: Patient[]) {
+  const map = new Map<string, Patient>();
+  [...secondary, ...primary].forEach((patient) => map.set(patient.patientId, patient));
+  return Array.from(map.values());
+}
+
+function mergeSessions(primary: TherapySession[], secondary: TherapySession[]) {
+  const map = new Map<string, TherapySession>();
+  [...secondary, ...primary].forEach((session) => map.set(session.sessionId, session));
+  return Array.from(map.values()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+function SessionList(props: { title: string; sessions: TherapySession[]; onOpen: (sessionId: string) => void }) {
+  return (
+    <section>
+      <div className="section-title">
+        <h2>{props.title}</h2>
+      </div>
+      <div className="list">
+        {props.sessions.length === 0 && <div className="empty-state">אין פגישות להצגה עדיין.</div>}
+        {props.sessions.map((session) => (
+          <button className="list-row" key={session.sessionId} onClick={() => props.onOpen(session.sessionId)}>
+            <span>
+              <strong>{session.patientDisplayName}</strong>
+              <small>{session.sessionDate} · {session.sessionStartTime}</small>
+            </span>
+            <span className={`status status-${session.processingStatus}`}>{statusLabel(session.processingStatus)}</span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function statusLabel(status: TherapySession["processingStatus"]) {
+  const labels = {
+    draft: "טיוטה",
+    pending: "ממתין לעיבוד",
+    processing: "בעיבוד",
+    completed: "הושלם",
+    failed: "נכשל"
+  };
+  return labels[status];
+}
+
+function PatientsView(props: {
+  patients: Patient[];
+  sessions: TherapySession[];
+  onCreate: (displayName: string) => void;
+  onOpen: (patientId: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const filtered = props.patients.filter((patient) => patient.displayName.includes(query));
+
+  return (
+    <section className="page-grid">
+      <div className="section-title">
+        <h1>מטופלים</h1>
+      </div>
+      <section className="toolbar">
+        <label>
+          <Search />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="חיפוש לפי שם" />
+        </label>
+        <label>
+          <UserRound />
+          <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="שם תצוגה למטופל חדש" />
+        </label>
+        <button
+          className="primary-button"
+          disabled={!displayName.trim()}
+          onClick={() => {
+            props.onCreate(displayName.trim());
+            setDisplayName("");
+          }}
+        >
+          <UsersRound />
+          צור מטופל חדש
+        </button>
+      </section>
+      <div className="list">
+        {filtered.map((patient) => {
+          const patientSessions = props.sessions.filter((session) => session.patientId === patient.patientId);
+          const lastSession = patientSessions.sort((a, b) => b.sessionDate.localeCompare(a.sessionDate))[0];
+          return (
+            <button className="list-row" key={patient.patientId} onClick={() => props.onOpen(patient.patientId)}>
+              <span>
+                <strong>{patient.displayName}</strong>
+                <small>{patientSessions.length} פגישות · אחרונה: {lastSession?.sessionDate || "אין"}</small>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function PatientView(props: {
+  patient: Patient;
+  sessions: TherapySession[];
+  onBack: () => void;
+  onSave: (patient: Patient) => void;
+  onDelete: () => void;
+  onOpenSession: (sessionId: string) => void;
+}) {
+  const [draft, setDraft] = useState(props.patient);
+
+  function updateOptional(key: keyof Patient["optionalDetails"], value: string) {
+    setDraft({ ...draft, optionalDetails: { ...draft.optionalDetails, [key]: value }, updatedAt: new Date().toISOString() });
+  }
+
+  return (
+    <section className="page-grid">
+      <div className="section-title">
+        <h1>כרטיס מטופל</h1>
+        <button className="secondary-button" onClick={props.onBack}>חזרה</button>
+      </div>
+      <section className="form-grid">
+        <label>שם תצוגה<input value={draft.displayName} onChange={(event) => setDraft({ ...draft, displayName: event.target.value })} /></label>
+        <label>שם מלא או פיקטיבי<input value={draft.optionalDetails.fullName} onChange={(event) => updateOptional("fullName", event.target.value)} /></label>
+        <label>טלפון<input value={draft.optionalDetails.phone} onChange={(event) => updateOptional("phone", event.target.value)} /></label>
+        <label>גיל<input value={draft.optionalDetails.age} onChange={(event) => updateOptional("age", event.target.value)} /></label>
+        <label>סטטוס טיפול<input value={draft.optionalDetails.treatmentStatus} onChange={(event) => updateOptional("treatmentStatus", event.target.value)} /></label>
+        <label className="wide">הערות כלליות<textarea value={draft.optionalDetails.generalNotes} onChange={(event) => updateOptional("generalNotes", event.target.value)} /></label>
+      </section>
+      <div className="action-strip">
+        <button className="primary-button" onClick={() => props.onSave({ ...draft, updatedAt: new Date().toISOString() })}><Save /> שמור</button>
+        <button className="danger-button" onClick={props.onDelete}><Trash2 /> מחק מטופל</button>
+      </div>
+      <SessionList title="פגישות המטופל" sessions={props.sessions} onOpen={props.onOpenSession} />
+    </section>
+  );
+}
+
+function NewSessionView(props: {
+  mode: "recording" | "upload";
+  userName: string;
+  patients: Patient[];
+  onCancel: () => void;
+  onCreatePatient: (displayName: string) => Patient;
+  onSaved: (session: TherapySession) => void;
+}) {
+  const [patientName, setPatientName] = useState("");
+  const [date, setDate] = useState(today());
+  const [time, setTime] = useState(timeNow());
+  const [participants, setParticipants] = useState("");
+  const [sessionType, setSessionType] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [seconds, setSeconds] = useState(0);
+  const [recordingMessage, setRecordingMessage] = useState("");
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const timerRef = useRef<number | null>(null);
+
+  async function startRecording() {
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setRecordingMessage("הדפדפן לא תומך בהקלטת מיקרופון.");
+        return;
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      chunksRef.current = [];
+      setRecordedBlob(null);
+      setSeconds(0);
+      setRecordingMessage("ההקלטה פעילה. מומלץ להשאיר את המסך פתוח.");
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunksRef.current.push(event.data);
+      };
+      recorder.onstop = () => {
+        setRecordedBlob(new Blob(chunksRef.current, { type: "audio/webm" }));
+        setRecordingMessage("ההקלטה נשמרה זמנית ומוכנה לעיבוד.");
+        stream.getTracks().forEach((track) => track.stop());
+      };
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setRecording(true);
+      timerRef.current = window.setInterval(() => setSeconds((value) => value + 1), 1000);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "לא הצלחנו לקבל הרשאת מיקרופון.";
+      setRecordingMessage(`לא הצלחנו להתחיל הקלטה: ${message}`);
+    }
+  }
+
+  function stopRecording() {
+    mediaRecorderRef.current?.stop();
+    if (timerRef.current) window.clearInterval(timerRef.current);
+    setRecording(false);
+  }
+
+  async function process() {
+    const displayName = patientName.trim();
+    if (!displayName) return;
+    const patient = props.patients.find((item) => item.displayName === displayName) || props.onCreatePatient(displayName);
+    const session = createSession({
+      patient,
+      therapistName: props.userName,
+      sourceType: props.mode,
+      sessionDate: date,
+      sessionStartTime: time,
+      participants,
+      sessionType
+    });
+    setIsProcessing(true);
+    try {
+      const completed = await processAudioDraft({ ...session, processingStatus: "processing" }, file || recordedBlob || undefined);
+      await deletePendingAudio(session.sessionId);
+      props.onSaved(completed);
+    } catch (error) {
+      const audio = file || recordedBlob;
+      if (audio) {
+        await savePendingAudio(session.sessionId, audio, {
+          patientDisplayName: session.patientDisplayName,
+          sessionDate: session.sessionDate,
+          sourceType: session.sourceType
+        });
+      }
+      const message = error instanceof Error ? error.message : "לא הצלחנו להפיק דו״ח. אפשר לנסות שוב.";
+      props.onSaved(buildFailedSession(session, message, navigator.onLine ? "failed" : "pending"));
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  return (
+    <section className="page-grid">
+      <div className="section-title">
+        <h1>{props.mode === "recording" ? "פגישה חדשה מתוך הקלטה" : "העלאת קובץ אודיו"}</h1>
+        <button className="secondary-button" onClick={props.onCancel}>חזרה</button>
+      </div>
+      <p className="warning">כדי למנוע עצירת הקלטה, מומלץ להשאיר את המסך פתוח עד סיום הפגישה.</p>
+      <section className="form-grid">
+        <label>שם מטופל או בחירה קיימת<input list="patients" value={patientName} onChange={(event) => setPatientName(event.target.value)} /></label>
+        <datalist id="patients">{props.patients.map((patient) => <option key={patient.patientId} value={patient.displayName} />)}</datalist>
+        <label>תאריך פגישה<input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label>
+        <label>שעת התחלה<input type="time" value={time} onChange={(event) => setTime(event.target.value)} /></label>
+        <label>שם מטפל<input value={props.userName} readOnly /></label>
+        <label>סוג פגישה<input value={sessionType} onChange={(event) => setSessionType(event.target.value)} /></label>
+        <label>נוכחים בפגישה<input value={participants} onChange={(event) => setParticipants(event.target.value)} /></label>
+      </section>
+      {props.mode === "recording" ? (
+        <section className="recorder-panel">
+          <strong>{new Date(seconds * 1000).toISOString().slice(11, 19)}</strong>
+          <div className="action-strip">
+            {!recording && <button className="primary-button" onClick={startRecording}><Play /> התחל הקלטה</button>}
+            {recording && <button className="danger-button" onClick={stopRecording}><Square /> עצירה</button>}
+            <button className="secondary-button" disabled><Pause /> השהיה</button>
+          </div>
+          {recordedBlob && <span className="small-note">הקלטה זמנית מוכנה לעיבוד. האודיו לא יישמר לאחר הצלחת העיבוד.</span>}
+          {recordingMessage && <span className={recording ? "success-message" : "small-note"}>{recordingMessage}</span>}
+        </section>
+      ) : (
+        <section className="upload-panel">
+          <input type="file" accept="audio/*" onChange={(event) => setFile(event.target.files?.[0] || null)} />
+          {file && <span>{file.name} · {(file.size / 1024 / 1024).toFixed(1)}MB</span>}
+        </section>
+      )}
+      <button className="primary-button" disabled={isProcessing || !patientName.trim() || (props.mode === "upload" && !file)} onClick={process}>
+        <FileText />
+        {isProcessing ? "מעבד..." : "הפק דו״ח"}
+      </button>
+    </section>
+  );
+}
+
+function buildFailedSession(session: TherapySession, message: string, status: TherapySession["processingStatus"]): TherapySession {
+  return {
+    ...session,
+    processingStatus: status,
+    report: {
+      title: "דו״ח סיכום פגישה טיפולית",
+      meetingTopic: "העיבוד נכשל",
+      sessionNarrative:
+        "לא נוצר דוח מהאודיו. ההקלטה נשמרה זמנית בדפדפן אם הייתה זמינה, כדי לאפשר ניסיון חוזר.",
+      therapeuticInsights: "לא הופקו תובנות טיפוליות משום שהעיבוד האוטומטי נכשל.",
+      followUpPoints: [
+        "לבדוק שהקובץ הוא קובץ אודיו תקין ולא גדול מדי.",
+        "לבדוק את הודעת השגיאה ולנסות שוב.",
+        "אם השגיאה קשורה למודל, לעדכן את שמות המודלים בקובץ .env."
+      ],
+      administrativeNotes: `שגיאת עיבוד: ${message}`,
+      crmSummary:
+        "לא הופק סיכום CRM משום שעיבוד האודיו נכשל.\n" +
+        "יש לנסות לעבד מחדש לאחר בדיקת הקובץ והגדרות ה-API.\n" +
+        "אין להסיק מסקנות טיפוליות מהפלט הנוכחי.\n" +
+        `פרטי שגיאה: ${message.slice(0, 180)}`
+    },
+    internalSessionMemory: {
+      factsFromSession: [],
+      aiInterpretations: [],
+      interventions: [],
+      riskOrUncertaintyNotes: [message],
+      openQuestionsForNextSession: []
+    },
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function SessionView(props: {
+  session: TherapySession;
+  previousSessions: TherapySession[];
+  onBack: () => void;
+  onDelete: () => void;
+  onSave: (session: TherapySession) => void;
+}) {
+  const [draft, setDraft] = useState(props.session);
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
+
+  function updateReport(key: keyof SessionReport, value: string | string[]) {
+    setDraft({ ...draft, report: { ...draft.report, [key]: value }, updatedAt: new Date().toISOString() });
+  }
+
+  async function ask(allPatientSessions: boolean) {
+    if (!question.trim()) return;
+    const response = await askSessionQuestion({
+      question,
+      session: draft,
+      previousSessions: allPatientSessions ? props.previousSessions : []
+    });
+    setAnswer(response);
+  }
+
+  async function shareText(text: string) {
+    try {
+      const isLikelyMobile = window.matchMedia("(pointer: coarse)").matches;
+      if (navigator.share && isLikelyMobile) {
+        await navigator.share({ text });
+        setStatusMessage("תפריט השיתוף נפתח.");
+      } else {
+        await navigator.clipboard.writeText(text);
+        setStatusMessage("הדוח הועתק ללוח. במחשב זה אמין יותר מתפריט השיתוף של הדפדפן.");
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setStatusMessage("השיתוף בוטל.");
+        return;
+      }
+      await navigator.clipboard.writeText(text);
+      setStatusMessage("השיתוף לא נפתח, אז הדוח הועתק ללוח.");
+    }
+  }
+
+  async function copyCrmSummary() {
+    await navigator.clipboard.writeText(draft.report.crmSummary || "");
+    setStatusMessage("סיכום ה-CRM הועתק ללוח.");
+  }
+
+  function saveDraft() {
+    props.onSave(draft);
+    setStatusMessage("הדוח נשמר מקומית במכשיר.");
+  }
+
+  const reportText = formatReport(draft);
+
+  return (
+    <section className="page-grid">
+      <div className="section-title">
+        <h1>דוח פגישה</h1>
+        <button className="secondary-button" onClick={props.onBack}>חזרה</button>
+      </div>
+      <section className="report-editor">
+        <h2>דו״ח סיכום פגישה טיפולית</h2>
+        {draft.processingStatus === "failed" && (
+          <p className="warning">{draft.report.administrativeNotes || "לא הצלחנו להפיק דו״ח. אפשר לנסות שוב."}</p>
+        )}
+        {statusMessage && <p className="success-message">{statusMessage}</p>}
+        <div className="meta-grid">
+          <span>תאריך המפגש: {draft.sessionDate}</span>
+          <span>שם המטופל/ת: {draft.patientDisplayName}</span>
+          <span>שם המטפל/ת: {draft.therapistName}</span>
+        </div>
+        <label>נושא המפגש<textarea value={draft.report.meetingTopic} onChange={(event) => updateReport("meetingTopic", event.target.value)} /></label>
+        <label>מהלך המפגש<textarea value={draft.report.sessionNarrative} onChange={(event) => updateReport("sessionNarrative", event.target.value)} /></label>
+        <label>תובנות מהתערבויות טיפוליות<textarea value={draft.report.therapeuticInsights} onChange={(event) => updateReport("therapeuticInsights", event.target.value)} /></label>
+        <label>נקודות חשובות למעקב<textarea value={draft.report.followUpPoints.join("\n")} onChange={(event) => updateReport("followUpPoints", event.target.value.split("\n").filter(Boolean))} /></label>
+        <label>הערות אדמיניסטרטיביות<textarea value={draft.report.administrativeNotes} onChange={(event) => updateReport("administrativeNotes", event.target.value)} /></label>
+        <label>סיכום קצר ל CRM<textarea value={draft.report.crmSummary} onChange={(event) => updateReport("crmSummary", event.target.value)} /></label>
+      </section>
+      <div className="action-strip">
+        <button className="primary-button" onClick={saveDraft}><Save /> שמור</button>
+        <button className="secondary-button" onClick={() => shareText(reportText)}><Share2 /> שתף טקסט</button>
+        <button className="secondary-button" onClick={copyCrmSummary}><ClipboardCopy /> העתק סיכום CRM</button>
+        <button className="secondary-button" onClick={async () => {
+          const blob = await createDocxBlob(draft);
+          downloadBlob(blob, `session_${draft.sessionId}.docx`);
+          if (getStoredAccessToken()) {
+            await uploadSessionDocxToDrive(getStoredAccessToken(), draft, blob);
+            setStatusMessage("קובץ Word נוצר, ירד למחשב ונשמר ב-Google Drive.");
+          } else {
+            setStatusMessage("קובץ Word נוצר ונשלח להורדה.");
+          }
+        }}><FileText /> ייצא Word</button>
+        <button className="danger-button" onClick={props.onDelete}><Trash2 /> מחק פגישה</button>
+      </div>
+      <section className="chat-panel">
+        <h2>שיחה עם הפגישה</h2>
+        <textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="שאל שאלה על הפגישה או על רצף הפגישות" />
+        <div className="action-strip">
+          <button className="secondary-button" onClick={() => ask(false)}><Send /> שאל על הפגישה</button>
+          <button className="secondary-button" onClick={() => ask(true)}><Send /> שאל על כל פגישות המטופל</button>
+        </div>
+        {answer && <p className="answer">{answer}</p>}
+      </section>
+    </section>
+  );
+}
+
+function formatReport(session: TherapySession) {
+  return [
+    "דו״ח סיכום פגישה טיפולית",
+    "",
+    `תאריך המפגש: ${session.sessionDate}`,
+    `שם המטופל/ת: ${session.patientDisplayName}`,
+    `שם המטפל/ת: ${session.therapistName}`,
+    "",
+    "נושא המפגש",
+    session.report.meetingTopic,
+    "",
+    "מהלך המפגש",
+    session.report.sessionNarrative,
+    "",
+    "תובנות מהתערבויות טיפוליות",
+    session.report.therapeuticInsights,
+    "",
+    "נקודות חשובות למעקב",
+    session.report.followUpPoints.map((point) => `• ${point}`).join("\n"),
+    "",
+    "הערות אדמיניסטרטיביות",
+    session.report.administrativeNotes,
+    "",
+    "סיכום קצר ל CRM",
+    session.report.crmSummary
+  ].join("\n");
+}
+
+async function createDocxBlob(session: TherapySession) {
+  const paragraph = (text: string, bold = false) =>
+    new Paragraph({
+      bidirectional: true,
+      alignment: AlignmentType.RIGHT,
+      spacing: { after: 180 },
+      children: [new TextRun({ text, bold, rightToLeft: true })]
+    });
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: {},
+        children: [
+          new Paragraph({
+            text: "דו״ח סיכום פגישה טיפולית",
+            heading: HeadingLevel.TITLE,
+            bidirectional: true,
+            alignment: AlignmentType.RIGHT
+          }),
+          paragraph(`תאריך המפגש: ${session.sessionDate}`),
+          paragraph(`שם המטופל/ת: ${session.patientDisplayName}`),
+          paragraph(`שם המטפל/ת: ${session.therapistName}`),
+          paragraph("נושא המפגש", true),
+          paragraph(session.report.meetingTopic),
+          paragraph("מהלך המפגש", true),
+          paragraph(session.report.sessionNarrative),
+          paragraph("תובנות מהתערבויות טיפוליות", true),
+          paragraph(session.report.therapeuticInsights),
+          paragraph("נקודות חשובות למעקב", true),
+          ...session.report.followUpPoints.map((point) => paragraph(point)),
+          paragraph("הערות אדמיניסטרטיביות", true),
+          paragraph(session.report.administrativeNotes),
+          paragraph("סיכום קצר ל CRM", true),
+          paragraph(session.report.crmSummary)
+        ]
+      }
+    ]
+  });
+  return Packer.toBlob(doc);
+}
+
+function downloadBlob(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}

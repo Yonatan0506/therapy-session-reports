@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: therapy-session-reports
+    runtime: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: OPENAI_TRANSCRIBE_MODEL
+        value: gpt-4o-mini-transcribe
+      - key: OPENAI_SUMMARY_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_CHAT_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_RETRY_ATTEMPTS
+        value: "3"
+      - key: AUDIO_CHUNK_SECONDS
+        value: "240"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: VITE_GOOGLE_CLIENT_ID
+        sync: false
