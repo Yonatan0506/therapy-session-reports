@@ -20,7 +20,6 @@ import com.google.android.gms.auth.api.signin.GoogleSignInAccount;
 import com.google.android.gms.auth.api.signin.GoogleSignInClient;
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions;
 import com.google.android.gms.common.api.ApiException;
-import com.google.android.gms.common.api.Scope;
 import com.google.android.gms.tasks.Task;
 
 import java.io.IOException;
@@ -35,16 +34,9 @@ public class NativeGoogleAuthPlugin extends Plugin {
 
     @PluginMethod
     public void signIn(PluginCall call) {
-        ArrayList<String> requestedScopes = readScopes(call);
         GoogleSignInOptions.Builder builder = new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
             .requestEmail()
             .requestProfile();
-
-        for (String scope : requestedScopes) {
-            if (!"openid".equals(scope) && !"email".equals(scope) && !"profile".equals(scope)) {
-                builder.requestScopes(new Scope(scope));
-            }
-        }
 
         GoogleSignInClient client = GoogleSignIn.getClient(getActivity(), builder.build());
         startActivityForResult(call, client.getSignInIntent(), "signInResult");
@@ -60,7 +52,12 @@ public class NativeGoogleAuthPlugin extends Plugin {
     @ActivityCallback
     private void signInResult(PluginCall call, ActivityResult result) {
         if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
-            call.reject("Google sign-in was cancelled.");
+            GoogleSignInAccount lastAccount = GoogleSignIn.getLastSignedInAccount(getContext());
+            if (lastAccount != null) {
+                fetchAccessToken(call, lastAccount, readScopes(call));
+                return;
+            }
+            call.reject("בחירת חשבון Google בוטלה או נחסמה. אם לא ביטלת ידנית, יש לבדוק שהוגדר Android OAuth client עם package name ו-SHA-1 נכונים.");
             return;
         }
 
@@ -70,7 +67,7 @@ public class NativeGoogleAuthPlugin extends Plugin {
             ArrayList<String> requestedScopes = readScopes(call);
             fetchAccessToken(call, account, requestedScopes);
         } catch (ApiException error) {
-            call.reject("Google sign-in failed: " + error.getStatusCode());
+            call.reject("Google sign-in failed. status=" + error.getStatusCode() + " message=" + error.getMessage());
         }
     }
 
