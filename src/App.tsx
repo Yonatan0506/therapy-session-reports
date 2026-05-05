@@ -198,6 +198,21 @@ export function App() {
     }
   }
 
+  function signInLocalTestMode() {
+    const nextUser = {
+      ...user,
+      userId: "android-local-test",
+      email: "local-test@example.local",
+      displayName: "בדיקה מקומית"
+    };
+    setUser(nextUser);
+    storage.saveUser(nextUser);
+    localStorage.setItem("therapy:signed-in", "true");
+    setIsSignedIn(true);
+    setView("home");
+    setAppMessage("מצב בדיקה מקומי פעיל. Google Drive לא מחובר, אבל אפשר לבדוק הקלטה.");
+  }
+
   async function connectGoogleDrive() {
     try {
       const result = await signInWithGoogle();
@@ -297,6 +312,12 @@ export function App() {
             <LogIn />
             כניסה עם Google
           </button>
+          {isNativeApp() && (
+            <button className="secondary-button" onClick={signInLocalTestMode}>
+              <Mic />
+              כניסה לבדיקה ללא Google
+            </button>
+          )}
           <span className="small-note">
             {isGoogleConfigured()
               ? "הכניסה תבקש הרשאת Drive מצומצמת מסוג drive.file."
@@ -786,6 +807,10 @@ function isNativeRecorderAvailable() {
       window.Capacitor?.Plugins?.NativeRecorder?.startRecording &&
       window.Capacitor?.Plugins?.NativeRecorder?.stopRecording
   );
+}
+
+function isNativeApp() {
+  return Boolean(window.Capacitor?.isNativePlatform?.());
 }
 
 function buildFailedSession(session: TherapySession, message: string, status: TherapySession["processingStatus"]): TherapySession {
