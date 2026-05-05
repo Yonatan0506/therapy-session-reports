@@ -77,7 +77,10 @@ app.post("/api/process-session", upload.single("audio"), async (req, res) => {
 
   try {
     const transcript = await transcribeAudio(req.file);
-    const aiReport = normalizeAiReport(await createTherapyReport(session, transcript), transcript);
+    let aiReport = normalizeAiReport(await createTherapyReport(session, transcript), transcript);
+    if (!reportLooksHebrew(aiReport)) {
+      aiReport = normalizeAiReport(await rewriteReportInHebrew(session, aiReport), transcript);
+    }
 
     res.json({
       ...session,
@@ -412,7 +415,7 @@ async function createTherapyReport(session: any, transcript: string) {
           {
             role: "system",
             content:
-              "אתה מסייע למטפל לנסח דו״ח סיכום פגישה טיפולית בעברית. החזר JSON תקין בלבד, ללא Markdown וללא טקסט מסביב. חובה להשתמש בשמות השדות באנגלית בדיוק כפי שמופיעים בסכמה. כתוב בגוף שלישי, בניסוח מקצועי, זהיר ולא אבחוני מדי. הפרד בין מידע שנאמר בפגישה לבין פרשנות טיפולית. אל תמציא פרטים."
+              "אתה מסייע למטפל לנסח דו״ח סיכום פגישה טיפולית בעברית בלבד. כל ערכי הטקסט בדוח חייבים להיות בעברית, גם אם התמלול, שמות המשתתפים או חלק מהשיחה באנגלית. החזר JSON תקין בלבד, ללא Markdown וללא טקסט מסביב. חובה להשתמש בשמות השדות באנגלית בדיוק כפי שמופיעים בסכמה. כתוב בגוף שלישי, בניסוח מקצועי, זהיר ולא אבחוני מדי. הפרד בין מידע שנאמר בפגישה לבין פרשנות טיפולית. אל תמציא פרטים."
           },
           {
             role: "user",
@@ -450,6 +453,59 @@ ${transcript}
   );
 
   return JSON.parse(completion.choices[0]?.message?.content || "{}");
+}
+
+async function rewriteReportInHebrew(session: any, report: any) {
+  if (!openai) throw new Error("missing_openai_client");
+
+  const completion = await withOpenAiRetry(
+    () =>
+      openai.chat.completions.create({
+        model: process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini",
+        temperature: 0,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "תקן דוח פגישה טיפולית כך שכל ערכי הטקסט יהיו בעברית בלבד. שמות השדות חייבים להישאר באנגלית בדיוק. אל תוסיף פרטים חדשים ואל תשנה עובדות. אם יש שמות פרטיים, השאר אותם כפי שנמסרו או תעתק לעברית אם טבעי. החזר JSON תקין בלבד."
+          },
+          {
+            role: "user",
+            content: JSON.stringify(
+              {
+                metadata: {
+                  sessionDate: session.sessionDate,
+                  patientDisplayName: session.patientDisplayName,
+                  therapistName: session.therapistName
+                },
+                report
+              },
+              null,
+              2
+            )
+          }
+        ]
+      }),
+    "תיקון שפת הדוח לעברית"
+  );
+
+  return JSON.parse(completion.choices[0]?.message?.content || "{}");
+}
+
+function reportLooksHebrew(report: any) {
+  const text = [
+    report?.meetingTopic,
+    report?.sessionNarrative,
+    report?.therapeuticInsights,
+    Array.isArray(report?.followUpPoints) ? report.followUpPoints.join(" ") : "",
+    report?.administrativeNotes,
+    report?.crmSummary
+  ].join(" ");
+
+  const hebrewLetters = (text.match(/[\u0590-\u05FF]/g) || []).length;
+  const latinLetters = (text.match(/[A-Za-z]/g) || []).length;
+  return hebrewLetters >= 40 && hebrewLetters >= latinLetters;
 }
 
 async function withOpenAiRetry<T>(operation: () => Promise<T>, label: string): Promise<T> {
