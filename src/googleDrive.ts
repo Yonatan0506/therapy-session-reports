@@ -42,6 +42,10 @@ export async function signInWithGoogle(): Promise<{ user: UserProfile; accessTok
     throw new Error("חסר VITE_GOOGLE_CLIENT_ID בקובץ .env");
   }
 
+  if (isNativeGoogleAuthAvailable()) {
+    return signInWithNativeGoogle();
+  }
+
   await waitForGoogleIdentity();
   const accessToken = await requestAccessToken();
   const profile = await fetchGoogleProfile(accessToken);
@@ -68,6 +72,9 @@ export function getStoredAccessToken() {
 
 export function disconnectGoogleDrive() {
   sessionStorage.removeItem("therapy:google-access-token");
+  if (isNativeGoogleAuthAvailable()) {
+    window.Capacitor!.Plugins!.NativeGoogleAuth!.signOut?.().catch(() => undefined);
+  }
 }
 
 export async function syncTherapyDataToDrive(payload: {
@@ -224,6 +231,43 @@ function requestAccessToken() {
 
     tokenClient.requestAccessToken({ prompt: "consent" });
   });
+}
+
+async function signInWithNativeGoogle(): Promise<{ user: UserProfile; accessToken: string }> {
+  const result = await window.Capacitor!.Plugins!.NativeGoogleAuth!.signIn({
+    scopes: GOOGLE_SCOPES.split(" ")
+  });
+  if (!result.accessToken) throw new Error("לא התקבל access token מ-Google באנדרואיד");
+
+  const profile = result.email
+    ? {
+        sub: result.userId || result.email,
+        email: result.email,
+        name: result.displayName || result.email
+      }
+    : await fetchGoogleProfile(result.accessToken);
+
+  const user: UserProfile = {
+    userId: profile.sub,
+    email: profile.email,
+    displayName: profile.name || profile.email,
+    createdAt: new Date().toISOString(),
+    settings: {
+      defaultLanguage: "he",
+      saveAudioAfterProcessing: false,
+      exportFormat: "docx"
+    }
+  };
+
+  sessionStorage.setItem("therapy:google-access-token", result.accessToken);
+  return { user, accessToken: result.accessToken };
+}
+
+function isNativeGoogleAuthAvailable() {
+  return Boolean(
+    window.Capacitor?.isNativePlatform?.() &&
+      window.Capacitor?.Plugins?.NativeGoogleAuth?.signIn
+  );
 }
 
 async function fetchGoogleProfile(accessToken: string): Promise<{ sub: string; email: string; name: string }> {

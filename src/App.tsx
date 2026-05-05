@@ -49,6 +49,15 @@ declare global {
       isNativePlatform?: () => boolean;
       convertFileSrc?: (path: string) => string;
       Plugins?: {
+        NativeGoogleAuth?: {
+          signIn: (options: { scopes: string[] }) => Promise<{
+            accessToken: string;
+            userId?: string;
+            email?: string;
+            displayName?: string;
+          }>;
+          signOut?: () => Promise<void>;
+        };
         NativeRecorder?: {
           startRecording: () => Promise<{ recording: boolean }>;
           stopRecording: () => Promise<{ path: string; name: string; mimeType: string }>;
