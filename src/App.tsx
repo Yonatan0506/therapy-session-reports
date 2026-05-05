@@ -43,6 +43,21 @@ import { deletePendingAudio, savePendingAudio } from "./offlineAudio";
 import { storage } from "./storage";
 import type { Patient, SessionReport, TherapySession } from "./types";
 
+declare global {
+  interface Window {
+    Capacitor?: {
+      isNativePlatform?: () => boolean;
+      convertFileSrc?: (path: string) => string;
+      Plugins?: {
+        NativeRecorder?: {
+          startRecording: () => Promise<{ recording: boolean }>;
+          stopRecording: () => Promise<{ path: string; name: string; mimeType: string }>;
+        };
+      };
+    };
+  }
+}
+
 type View = "login" | "home" | "patients" | "patient" | "new-recording" | "new-upload" | "session";
 
 const emptyReport: SessionReport = {
@@ -620,12 +635,26 @@ function NewSessionView(props: {
   const [recording, setRecording] = useState(false);
   const [seconds, setSeconds] = useState(0);
   const [recordingMessage, setRecordingMessage] = useState("");
+  const [nativeRecording, setNativeRecording] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
 
   async function startRecording() {
     try {
+      if (isNativeRecorderAvailable()) {
+        const permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        permissionStream.getTracks().forEach((track) => track.stop());
+        await window.Capacitor!.Plugins!.NativeRecorder!.startRecording();
+        setRecordedBlob(null);
+        setSeconds(0);
+        setNativeRecording(true);
+        setRecording(true);
+        setRecordingMessage("הקלטה Native פעילה. אפשר לכבות מסך, אך אין לסגור את האפליקציה.");
+        timerRef.current = window.setInterval(() => setSeconds((value) => value + 1), 1000);
+        return;
+      }
+
       if (!navigator.mediaDevices?.getUserMedia) {
         setRecordingMessage("הדפדפן לא תומך בהקלטת מיקרופון.");
         return;
@@ -655,8 +684,23 @@ function NewSessionView(props: {
     }
   }
 
-  function stopRecording() {
-    mediaRecorderRef.current?.stop();
+  async function stopRecording() {
+    if (nativeRecording && isNativeRecorderAvailable()) {
+      try {
+        const result = await window.Capacitor!.Plugins!.NativeRecorder!.stopRecording();
+        const webPath = window.Capacitor!.convertFileSrc ? window.Capacitor!.convertFileSrc(result.path) : result.path;
+        const response = await fetch(webPath);
+        const blob = await response.blob();
+        setRecordedBlob(new Blob([blob], { type: result.mimeType || "audio/mp4" }));
+        setRecordingMessage("הקלטת Native נשמרה זמנית ומוכנה לעיבוד.");
+      } catch (error) {
+        setRecordingMessage(error instanceof Error ? error.message : "לא הצלחנו לעצור הקלטה Native.");
+      }
+      setNativeRecording(false);
+    } else {
+      mediaRecorderRef.current?.stop();
+    }
+
     if (timerRef.current) window.clearInterval(timerRef.current);
     setRecording(false);
   }
@@ -733,6 +777,14 @@ function NewSessionView(props: {
         {isProcessing ? "מעבד..." : "הפק דו״ח"}
       </button>
     </section>
+  );
+}
+
+function isNativeRecorderAvailable() {
+  return Boolean(
+    window.Capacitor?.isNativePlatform?.() &&
+      window.Capacitor?.Plugins?.NativeRecorder?.startRecording &&
+      window.Capacitor?.Plugins?.NativeRecorder?.stopRecording
   );
 }
 
