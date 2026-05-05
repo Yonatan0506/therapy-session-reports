@@ -664,8 +664,6 @@ function NewSessionView(props: {
   async function startRecording() {
     try {
       if (isNativeRecorderAvailable()) {
-        const permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        permissionStream.getTracks().forEach((track) => track.stop());
         await window.Capacitor!.Plugins!.NativeRecorder!.startRecording();
         setRecordedBlob(null);
         setSeconds(0);
