@@ -234,6 +234,20 @@ label {
   color: #334155;
 }
 
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  max-width: 100%;
+}
+
+.checkbox-row input {
+  width: 18px;
+  min-height: 18px;
+  padding: 0;
+}
+
 input {
   min-height: 42px;
   padding: 9px 11px;

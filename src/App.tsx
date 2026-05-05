@@ -38,6 +38,7 @@ import {
   loadTherapyDataFromDrive,
   signInWithGoogle,
   syncTherapyDataToDrive,
+  uploadSessionAudioToDrive,
   uploadSessionDocxToDrive
 } from "./googleDrive";
 import { deletePendingAudio, savePendingAudio } from "./offlineAudio";
@@ -452,6 +453,7 @@ export function App() {
         <NewSessionView
           mode={view === "new-recording" ? "recording" : "upload"}
           userName={user.displayName}
+          googleAccessToken={googleAccessToken}
           patients={patients}
           onCancel={() => setView("home")}
           onCreatePatient={(displayName) => {
@@ -665,6 +667,7 @@ function PatientView(props: {
 function NewSessionView(props: {
   mode: "recording" | "upload";
   userName: string;
+  googleAccessToken: string;
   patients: Patient[];
   onCancel: () => void;
   onCreatePatient: (displayName: string) => Patient;
@@ -682,6 +685,7 @@ function NewSessionView(props: {
   const [seconds, setSeconds] = useState(0);
   const [recordingMessage, setRecordingMessage] = useState("");
   const [nativeRecording, setNativeRecording] = useState(false);
+  const [saveOriginalAudio, setSaveOriginalAudio] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
@@ -774,8 +778,26 @@ function NewSessionView(props: {
     setIsProcessing(true);
     try {
       const completed = await processAudioDraft({ ...session, processingStatus: "processing" }, audio);
+      let finalSession = completed;
+      if (saveOriginalAudio && props.googleAccessToken) {
+        try {
+          const audioFileName = buildAudioFileName(completed, audio, file?.name);
+          await uploadSessionAudioToDrive(props.googleAccessToken, completed, audio, audioFileName);
+          finalSession = {
+            ...completed,
+            audioStored: true,
+            audioFileName,
+            audioMimeType: audio.type || "application/octet-stream",
+            updatedAt: new Date().toISOString()
+          };
+          setRecordingMessage("קובץ האודיו המקורי נשמר ב-Google Drive.");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "שמירת האודיו ל-Google Drive נכשלה.";
+          setRecordingMessage(`הדוח הופק, אך האודיו לא נשמר: ${message}`);
+        }
+      }
       await deletePendingAudio(session.sessionId);
-      props.onSaved(completed);
+      props.onSaved(finalSession);
     } catch (error) {
       if (audio) {
         await savePendingAudio(session.sessionId, audio, {
@@ -815,7 +837,11 @@ function NewSessionView(props: {
             {recording && <button className="danger-button" onClick={stopRecording}><Square /> עצירה</button>}
             <button className="secondary-button" disabled><Pause /> השהיה</button>
           </div>
-          {recordedBlob && <span className="small-note">הקלטה זמנית מוכנה לעיבוד. האודיו לא יישמר לאחר הצלחת העיבוד.</span>}
+          {recordedBlob && (
+            <span className="small-note">
+              הקלטה זמנית מוכנה לעיבוד. האודיו יישמר רק אם תסמן במפורש שמירת אודיו מקורי.
+            </span>
+          )}
           {recordingMessage && <span className={recording ? "success-message" : "small-note"}>{recordingMessage}</span>}
         </section>
       ) : (
@@ -823,6 +849,21 @@ function NewSessionView(props: {
           <input type="file" accept="audio/*" onChange={(event) => setFile(event.target.files?.[0] || null)} />
           {file && <span>{file.name} · {(file.size / 1024 / 1024).toFixed(1)}MB</span>}
         </section>
+      )}
+      <label className="checkbox-row">
+        <input
+          type="checkbox"
+          checked={saveOriginalAudio}
+          disabled={!props.googleAccessToken}
+          onChange={(event) => setSaveOriginalAudio(event.target.checked)}
+        />
+        שמור את קובץ האודיו המקורי ב-Google Drive
+      </label>
+      {!props.googleAccessToken && (
+        <span className="small-note">כדי לשמור אודיו מקורי צריך קודם לחבר Google Drive. ברירת המחדל נשארת לא לשמור אודיו.</span>
+      )}
+      {saveOriginalAudio && (
+        <p className="warning">שים לב: שמירת אודיו מגדילה משמעותית את רגישות המידע ואת נפח האחסון ב-Drive.</p>
       )}
       <button className="primary-button" disabled={isProcessing || recording || !patientName.trim() || !(file || recordedBlob)} onClick={process}>
         <FileText />
@@ -842,6 +883,22 @@ function isNativeRecorderAvailable() {
 
 function isNativeApp() {
   return Boolean(window.Capacitor?.isNativePlatform?.());
+}
+
+function buildAudioFileName(session: TherapySession, audio: Blob, originalName?: string) {
+  const safeOriginalName = originalName?.replace(/[\\/:*?"<>|]/g, "_").trim();
+  if (safeOriginalName) return `session_${session.sessionId}_${safeOriginalName}`;
+  const extension = audioExtensionFromMime(audio.type);
+  return `session_${session.sessionId}_original_audio.${extension}`;
+}
+
+function audioExtensionFromMime(mimeType: string) {
+  if (mimeType.includes("mp4") || mimeType.includes("m4a")) return "m4a";
+  if (mimeType.includes("mpeg") || mimeType.includes("mp3")) return "mp3";
+  if (mimeType.includes("wav")) return "wav";
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("webm")) return "webm";
+  return "audio";
 }
 
 function buildFailedSession(session: TherapySession, message: string, status: TherapySession["processingStatus"]): TherapySession {
@@ -951,6 +1008,7 @@ function SessionView(props: {
           <span>תאריך המפגש: {draft.sessionDate}</span>
           <span>שם המטופל/ת: {draft.patientDisplayName}</span>
           <span>שם המטפל/ת: {draft.therapistName}</span>
+          <span>אודיו מקור: {draft.audioStored ? "נשמר ב-Google Drive" : "לא נשמר"}</span>
         </div>
         <label>נושא המפגש<textarea value={draft.report.meetingTopic} onChange={(event) => updateReport("meetingTopic", event.target.value)} /></label>
         <label>מהלך המפגש<textarea value={draft.report.sessionNarrative} onChange={(event) => updateReport("sessionNarrative", event.target.value)} /></label>

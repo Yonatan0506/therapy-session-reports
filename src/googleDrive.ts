@@ -142,6 +142,15 @@ export async function uploadSessionDocxToDrive(accessToken: string, session: The
   await uploadDocxToDrive(accessToken, `session_${session.sessionId}.docx`, blob);
 }
 
+export async function uploadSessionAudioToDrive(accessToken: string, session: TherapySession, blob: Blob, fileName: string) {
+  const folderId = await ensureAppFolder(accessToken);
+  const patientsFolderId = await ensureChildFolder(accessToken, folderId, "patients");
+  const patientFolderId = await ensureChildFolder(accessToken, patientsFolderId, `patient_${session.patientId}`);
+  const audioFolderId = await ensureChildFolder(accessToken, patientFolderId, "audio");
+  const mimeType = blob.type || "application/octet-stream";
+  await uploadBlobFile(accessToken, audioFolderId, fileName, mimeType, blob);
+}
+
 export async function deleteSessionFromDrive(accessToken: string, session: TherapySession) {
   const folderId = await ensureAppFolder(accessToken);
   const patientsFolderId = await findFile(accessToken, folderId, "patients");
@@ -150,6 +159,7 @@ export async function deleteSessionFromDrive(accessToken: string, session: Thera
     if (patientFolderId) {
       const sessionsFolderId = await findFile(accessToken, patientFolderId, "sessions");
       const exportsFolderId = await findFile(accessToken, patientFolderId, "exports");
+      const audioFolderId = await findFile(accessToken, patientFolderId, "audio");
       if (sessionsFolderId) {
         const sessionFileId = await findFile(accessToken, sessionsFolderId, `session_${session.sessionId}.json`);
         if (sessionFileId) await deleteDriveFile(accessToken, sessionFileId);
@@ -157,6 +167,10 @@ export async function deleteSessionFromDrive(accessToken: string, session: Thera
       if (exportsFolderId) {
         const docxFileId = await findFile(accessToken, exportsFolderId, `session_${session.sessionId}.docx`);
         if (docxFileId) await deleteDriveFile(accessToken, docxFileId);
+      }
+      if (audioFolderId && session.audioFileName) {
+        const audioFileId = await findFile(accessToken, audioFolderId, session.audioFileName);
+        if (audioFileId) await deleteDriveFile(accessToken, audioFileId);
       }
     }
   }

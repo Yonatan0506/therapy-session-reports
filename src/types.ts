@@ -47,6 +47,8 @@ export interface TherapySession {
   price: number | null;
   sourceType: "recording" | "upload";
   audioStored: boolean;
+  audioFileName?: string;
+  audioMimeType?: string;
   processingStatus: ProcessingStatus;
   report: SessionReport;
   internalSessionMemory: InternalSessionMemory;
