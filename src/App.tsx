@@ -729,6 +729,15 @@ function NewSessionView(props: {
   async function process() {
     const displayName = patientName.trim();
     if (!displayName) return;
+    const audio = file || recordedBlob;
+    if (!audio) {
+      setRecordingMessage(
+        props.mode === "recording"
+          ? "יש להתחיל הקלטה, לעצור אותה, ורק אחרי שמופיעה הודעה שההקלטה מוכנה לעיבוד להפיק דו״ח."
+          : "יש לבחור קובץ אודיו לפני הפקת דו״ח."
+      );
+      return;
+    }
     const patient = props.patients.find((item) => item.displayName === displayName) || props.onCreatePatient(displayName);
     const session = createSession({
       patient,
@@ -741,11 +750,10 @@ function NewSessionView(props: {
     });
     setIsProcessing(true);
     try {
-      const completed = await processAudioDraft({ ...session, processingStatus: "processing" }, file || recordedBlob || undefined);
+      const completed = await processAudioDraft({ ...session, processingStatus: "processing" }, audio);
       await deletePendingAudio(session.sessionId);
       props.onSaved(completed);
     } catch (error) {
-      const audio = file || recordedBlob;
       if (audio) {
         await savePendingAudio(session.sessionId, audio, {
           patientDisplayName: session.patientDisplayName,
@@ -793,7 +801,7 @@ function NewSessionView(props: {
           {file && <span>{file.name} · {(file.size / 1024 / 1024).toFixed(1)}MB</span>}
         </section>
       )}
-      <button className="primary-button" disabled={isProcessing || !patientName.trim() || (props.mode === "upload" && !file)} onClick={process}>
+      <button className="primary-button" disabled={isProcessing || recording || !patientName.trim() || !(file || recordedBlob)} onClick={process}>
         <FileText />
         {isProcessing ? "מעבד..." : "הפק דו״ח"}
       </button>

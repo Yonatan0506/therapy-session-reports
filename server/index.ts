@@ -59,8 +59,19 @@ app.post("/api/process-session", upload.single("audio"), async (req, res) => {
   const session = parseSession(req.body?.session);
   const fallback = buildDemoSession(session, now);
 
-  if (!openai || !req.file) {
-    res.json(fallback);
+  if (!req.file) {
+    res.status(400).json({
+      error: "missing_audio",
+      message: "לא צורף קובץ אודיו לעיבוד. יש להקליט ולעצור את ההקלטה לפני הפקת דו״ח, או להעלות קובץ אודיו."
+    });
+    return;
+  }
+
+  if (!openai) {
+    res.status(500).json({
+      error: "missing_openai_key",
+      message: "OPENAI_API_KEY לא נטען בשרת. יש לבדוק את משתני הסביבה ב-Render."
+    });
     return;
   }
 
