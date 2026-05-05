@@ -43,3 +43,24 @@ export async function askSessionQuestion(payload: {
   const data = (await response.json()) as { answer: string };
   return data.answer;
 }
+
+export async function createProgressSummary(payload: {
+  patientDisplayName: string;
+  dateFrom: string;
+  dateTo: string;
+  sessions: TherapySession[];
+}): Promise<string> {
+  const response = await fetch("/api/progress-summary", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    throw new Error(data?.message || data?.error || "progress_summary_failed");
+  }
+
+  const data = (await response.json()) as { summary: string };
+  return data.summary;
+}

@@ -148,6 +148,69 @@ app.post("/api/chat-session", async (req, res) => {
   }
 });
 
+app.post("/api/progress-summary", async (req, res) => {
+  const sessions = Array.isArray(req.body?.sessions) ? req.body.sessions : [];
+  if (!sessions.length) {
+    res.status(400).json({ error: "missing_sessions", message: "אין פגישות בטווח שנבחר." });
+    return;
+  }
+
+  if (!openai) {
+    res.json({ summary: "אין מספיק מידע בדוחות הפגישה כדי להפיק סיכום התקדמות." });
+    return;
+  }
+
+  try {
+    const completion = await withOpenAiRetry(
+      () =>
+        openai.chat.completions.create({
+          model: process.env.OPENAI_CHAT_MODEL || "gpt-4.1-mini",
+          temperature: 0.2,
+          messages: [
+            {
+              role: "system",
+              content:
+                "אתה מסייע למטפל להפיק סיכום התקדמות תקופתי בעברית על בסיס דוחות פגישות בלבד. אל תמציא מידע. הבחן בין מידע שעלה בפגישות לבין פרשנות טיפולית. כתוב מקצועי, זהיר ולא אבחוני מדי."
+            },
+            {
+              role: "user",
+              content: JSON.stringify(
+                {
+                  patientDisplayName: req.body?.patientDisplayName,
+                  dateFrom: req.body?.dateFrom,
+                  dateTo: req.body?.dateTo,
+                  requestedStructure: [
+                    "תיאור תמציתי של התהליך",
+                    "נושאים חוזרים",
+                    "שינויים שנצפו",
+                    "מוקדי קושי",
+                    "מוקדי התקדמות",
+                    "נקודות להמשך טיפול",
+                    "סיכום CRM תקופתי קצר"
+                  ],
+                  sessions: sessions.map((session: any) => ({
+                    sessionDate: session.sessionDate,
+                    report: session.report,
+                    internalSessionMemory: session.internalSessionMemory
+                  }))
+                },
+                null,
+                2
+              )
+            }
+          ]
+        }),
+      "סיכום התקדמות"
+    );
+
+    res.json({ summary: completion.choices[0]?.message?.content || "אין מספיק מידע בדוחות הפגישה כדי להפיק סיכום התקדמות." });
+  } catch (error) {
+    const message = getSafeErrorMessage(error);
+    console.error("progress_summary_failed", message);
+    res.status(500).json({ error: "progress_summary_failed", message });
+  }
+});
+
 function parseSession(raw: unknown) {
   if (typeof raw === "string") {
     try {

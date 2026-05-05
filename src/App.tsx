@@ -13,6 +13,7 @@ import {
   FileAudio,
   FileText,
   LogIn,
+  LogOut,
   Mic,
   Pause,
   Play,
@@ -26,8 +27,11 @@ import {
   UsersRound
 } from "lucide-react";
 import { v4 as uuid } from "uuid";
-import { askSessionQuestion, processAudioDraft } from "./ai";
+import { askSessionQuestion, createProgressSummary, processAudioDraft } from "./ai";
 import {
+  deletePatientFromDrive,
+  deleteSessionFromDrive,
+  disconnectGoogleDrive,
   getStoredAccessToken,
   isGoogleConfigured,
   loadTherapyDataFromDrive,
@@ -212,17 +216,48 @@ export function App() {
     setSelectedSessionId(session.sessionId);
   }
 
-  function deleteSession(sessionId: string) {
-    persistSessions(sessions.filter((session) => session.sessionId !== sessionId));
+  async function deleteSession(sessionId: string) {
+    const session = sessions.find((item) => item.sessionId === sessionId);
+    const nextSessions = sessions.filter((item) => item.sessionId !== sessionId);
+    persistSessions(nextSessions);
+    if (googleAccessToken && session) {
+      try {
+        await deleteSessionFromDrive(googleAccessToken, session);
+        await syncTherapyDataToDrive({ accessToken: googleAccessToken, patients, sessions: nextSessions });
+        setAppMessage("הפגישה נמחקה גם מ-Google Drive.");
+      } catch (error) {
+        setAppMessage(error instanceof Error ? error.message : "מחיקה מ-Google Drive נכשלה");
+      }
+    }
     setSelectedSessionId(null);
     setView("home");
   }
 
-  function deletePatient(patientId: string) {
-    persistPatients(patients.filter((patient) => patient.patientId !== patientId));
-    persistSessions(sessions.filter((session) => session.patientId !== patientId));
+  async function deletePatient(patientId: string) {
+    const nextPatients = patients.filter((patient) => patient.patientId !== patientId);
+    const nextSessions = sessions.filter((session) => session.patientId !== patientId);
+    persistPatients(nextPatients);
+    persistSessions(nextSessions);
+    if (googleAccessToken) {
+      try {
+        await deletePatientFromDrive(googleAccessToken, patientId);
+        await syncTherapyDataToDrive({ accessToken: googleAccessToken, patients: nextPatients, sessions: nextSessions });
+        setAppMessage("המטופל נמחק גם מ-Google Drive.");
+      } catch (error) {
+        setAppMessage(error instanceof Error ? error.message : "מחיקה מ-Google Drive נכשלה");
+      }
+    }
     setSelectedPatientId(null);
     setView("patients");
+  }
+
+  function signOut() {
+    disconnectGoogleDrive();
+    localStorage.removeItem("therapy:signed-in");
+    setGoogleAccessToken("");
+    setIsSignedIn(false);
+    setView("login");
+    setAppMessage("התנתקת מהמערכת במכשיר הזה.");
   }
 
   const filteredSessions = useMemo(() => {
@@ -275,6 +310,10 @@ export function App() {
           </button>
         )}
         {googleAccessToken && <span className="drive-chip">Drive מחובר</span>}
+        <button className="secondary-button" onClick={signOut}>
+          <LogOut />
+          יציאה
+        </button>
       </header>
       {appMessage && <div className="app-message">{appMessage}</div>}
 
@@ -489,6 +528,10 @@ function PatientView(props: {
   onOpenSession: (sessionId: string) => void;
 }) {
   const [draft, setDraft] = useState(props.patient);
+  const [summaryFrom, setSummaryFrom] = useState("");
+  const [summaryTo, setSummaryTo] = useState("");
+  const [progressSummary, setProgressSummary] = useState("");
+  const [summaryStatus, setSummaryStatus] = useState("");
 
   function updateOptional(key: keyof Patient["optionalDetails"], value: string) {
     setDraft({ ...draft, optionalDetails: { ...draft.optionalDetails, [key]: value }, updatedAt: new Date().toISOString() });
@@ -512,6 +555,47 @@ function PatientView(props: {
         <button className="primary-button" onClick={() => props.onSave({ ...draft, updatedAt: new Date().toISOString() })}><Save /> שמור</button>
         <button className="danger-button" onClick={props.onDelete}><Trash2 /> מחק מטופל</button>
       </div>
+      <section className="chat-panel">
+        <h2>סיכום התקדמות</h2>
+        <div className="toolbar">
+          <label>
+            <CalendarDays />
+            <input type="date" value={summaryFrom} onChange={(event) => setSummaryFrom(event.target.value)} />
+          </label>
+          <label>
+            <CalendarDays />
+            <input type="date" value={summaryTo} onChange={(event) => setSummaryTo(event.target.value)} />
+          </label>
+          <button
+            className="secondary-button"
+            onClick={async () => {
+              setSummaryStatus("מפיק סיכום...");
+              try {
+                const from = summaryFrom || "0000-01-01";
+                const to = summaryTo || "9999-12-31";
+                const relevantSessions = props.sessions.filter(
+                  (session) => session.sessionDate >= from && session.sessionDate <= to
+                );
+                const summary = await createProgressSummary({
+                  patientDisplayName: props.patient.displayName,
+                  dateFrom: summaryFrom || "תחילת הטיפול",
+                  dateTo: summaryTo || "היום",
+                  sessions: relevantSessions
+                });
+                setProgressSummary(summary);
+                setSummaryStatus("סיכום התקדמות הופק.");
+              } catch (error) {
+                setSummaryStatus(error instanceof Error ? error.message : "לא הצלחנו להפיק סיכום התקדמות.");
+              }
+            }}
+          >
+            <FileText />
+            הפק סיכום התקדמות
+          </button>
+        </div>
+        {summaryStatus && <p className="success-message">{summaryStatus}</p>}
+        {progressSummary && <textarea value={progressSummary} onChange={(event) => setProgressSummary(event.target.value)} />}
+      </section>
       <SessionList title="פגישות המטופל" sessions={props.sessions} onOpen={props.onOpenSession} />
     </section>
   );

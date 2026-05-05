@@ -66,6 +66,10 @@ export function getStoredAccessToken() {
   return sessionStorage.getItem("therapy:google-access-token") || "";
 }
 
+export function disconnectGoogleDrive() {
+  sessionStorage.removeItem("therapy:google-access-token");
+}
+
 export async function syncTherapyDataToDrive(payload: {
   accessToken: string;
   patients: Patient[];
@@ -124,6 +128,39 @@ export async function uploadSessionDocxToDrive(accessToken: string, session: The
     blob
   );
   await uploadDocxToDrive(accessToken, `session_${session.sessionId}.docx`, blob);
+}
+
+export async function deleteSessionFromDrive(accessToken: string, session: TherapySession) {
+  const folderId = await ensureAppFolder(accessToken);
+  const patientsFolderId = await findFile(accessToken, folderId, "patients");
+  if (patientsFolderId) {
+    const patientFolderId = await findFile(accessToken, patientsFolderId, `patient_${session.patientId}`);
+    if (patientFolderId) {
+      const sessionsFolderId = await findFile(accessToken, patientFolderId, "sessions");
+      const exportsFolderId = await findFile(accessToken, patientFolderId, "exports");
+      if (sessionsFolderId) {
+        const sessionFileId = await findFile(accessToken, sessionsFolderId, `session_${session.sessionId}.json`);
+        if (sessionFileId) await deleteDriveFile(accessToken, sessionFileId);
+      }
+      if (exportsFolderId) {
+        const docxFileId = await findFile(accessToken, exportsFolderId, `session_${session.sessionId}.docx`);
+        if (docxFileId) await deleteDriveFile(accessToken, docxFileId);
+      }
+    }
+  }
+
+  const flatSessionId = await findFile(accessToken, folderId, `session_${session.sessionId}.json`);
+  const flatDocxId = await findFile(accessToken, folderId, `session_${session.sessionId}.docx`);
+  if (flatSessionId) await deleteDriveFile(accessToken, flatSessionId);
+  if (flatDocxId) await deleteDriveFile(accessToken, flatDocxId);
+}
+
+export async function deletePatientFromDrive(accessToken: string, patientId: string) {
+  const folderId = await ensureAppFolder(accessToken);
+  const patientsFolderId = await findFile(accessToken, folderId, "patients");
+  if (!patientsFolderId) return;
+  const patientFolderId = await findFile(accessToken, patientsFolderId, `patient_${patientId}`);
+  if (patientFolderId) await deleteDriveFile(accessToken, patientFolderId);
 }
 
 export async function loadTherapyDataFromDrive(accessToken: string): Promise<{
@@ -301,6 +338,10 @@ async function findFile(accessToken: string, folderId: string, fileName: string)
   const query = encodeURIComponent(`name='${safeName}' and '${folderId}' in parents and trashed=false`);
   const result = await driveFetch(accessToken, `/drive/v3/files?q=${query}&fields=files(id,name)`);
   return result.files?.[0]?.id as string | undefined;
+}
+
+async function deleteDriveFile(accessToken: string, fileId: string) {
+  await driveFetch(accessToken, `/drive/v3/files/${fileId}`, { method: "DELETE" });
 }
 
 async function driveFetch(accessToken: string, path: string, init: RequestInit = {}) {
