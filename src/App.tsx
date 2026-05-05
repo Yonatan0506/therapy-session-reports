@@ -34,6 +34,7 @@ import {
   disconnectGoogleDrive,
   getStoredAccessToken,
   isGoogleConfigured,
+  isGoogleAuthError,
   loadTherapyDataFromDrive,
   signInWithGoogle,
   syncTherapyDataToDrive,
@@ -166,9 +167,25 @@ export function App() {
       patients: nextPatients,
       sessions: nextSessions
     }).catch((error) => {
+      if (isGoogleAuthError(error)) {
+        disconnectGoogleDrive();
+        setGoogleAccessToken("");
+        setAppMessage("החיבור ל-Google Drive פג. לחץ על ״חבר Google Drive״ ואז שמור שוב.");
+        return;
+      }
       const message = error instanceof Error ? error.message : "שגיאת סנכרון Google Drive";
       setAppMessage(message);
     });
+  }
+
+  function handleDriveError(error: unknown, fallbackMessage: string) {
+    if (isGoogleAuthError(error)) {
+      disconnectGoogleDrive();
+      setGoogleAccessToken("");
+      setAppMessage("החיבור ל-Google Drive פג. לחץ על ״חבר Google Drive״ ונסה שוב.");
+      return;
+    }
+    setAppMessage(error instanceof Error ? error.message : fallbackMessage);
   }
 
   function persistPatients(next: Patient[]) {
@@ -245,8 +262,7 @@ export function App() {
       });
       setAppMessage("Google Drive חובר. הנתונים נטענו וסונכרנו.");
     } catch (error) {
-      const message = error instanceof Error ? error.message : "חיבור Google Drive נכשל";
-      setAppMessage(message);
+      handleDriveError(error, "חיבור Google Drive נכשל");
     }
   }
 
@@ -265,7 +281,7 @@ export function App() {
         await syncTherapyDataToDrive({ accessToken: googleAccessToken, patients, sessions: nextSessions });
         setAppMessage("הפגישה נמחקה גם מ-Google Drive.");
       } catch (error) {
-        setAppMessage(error instanceof Error ? error.message : "מחיקה מ-Google Drive נכשלה");
+        handleDriveError(error, "מחיקה מ-Google Drive נכשלה");
       }
     }
     setSelectedSessionId(null);
@@ -283,7 +299,7 @@ export function App() {
         await syncTherapyDataToDrive({ accessToken: googleAccessToken, patients: nextPatients, sessions: nextSessions });
         setAppMessage("המטופל נמחק גם מ-Google Drive.");
       } catch (error) {
-        setAppMessage(error instanceof Error ? error.message : "מחיקה מ-Google Drive נכשלה");
+        handleDriveError(error, "מחיקה מ-Google Drive נכשלה");
       }
     }
     setSelectedPatientId(null);

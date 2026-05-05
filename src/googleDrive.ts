@@ -77,6 +77,11 @@ export function disconnectGoogleDrive() {
   }
 }
 
+export function isGoogleAuthError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return message.includes("Google Drive: 401") || message.includes("invalid authentication credentials");
+}
+
 export async function syncTherapyDataToDrive(payload: {
   accessToken: string;
   patients: Patient[];
