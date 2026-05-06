@@ -11,10 +11,15 @@ export async function processAudioDraft(session: TherapySession, audioFile?: Fil
     formData.set("audio", file);
   }
 
-  const response = await fetch("/api/process-session", {
-    method: "POST",
-    body: formData
-  });
+  let response: Response;
+  try {
+    response = await fetch("/api/process-session", {
+      method: "POST",
+      body: formData
+    });
+  } catch {
+    throw new Error("לא הצלחנו להתחבר לשרת העיבוד. בדוק חיבור אינטרנט, המתן רגע ונסה שוב. אם זו הקלטה ארוכה, מומלץ לוודא שהטלפון לא במצב חיסכון בסוללה.");
+  }
 
   if (!response.ok) {
     const payload = await response.json().catch(() => null);

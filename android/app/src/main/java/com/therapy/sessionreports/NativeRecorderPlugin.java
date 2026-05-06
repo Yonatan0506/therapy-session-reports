@@ -55,17 +55,31 @@ public class NativeRecorderPlugin extends Plugin {
 
         JSObject result = new JSObject();
         result.put("recording", true);
+        result.put("startedAt", ForegroundRecordingService.getStartedAt());
+        call.resolve(result);
+    }
+
+    @PluginMethod
+    public void getStatus(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("recording", ForegroundRecordingService.isRecording());
+        result.put("startedAt", ForegroundRecordingService.getStartedAt());
+        result.put("sizeBytes", ForegroundRecordingService.getOutputSize());
+        result.put("lastError", ForegroundRecordingService.getLastError());
         call.resolve(result);
     }
 
     @PluginMethod
     public void stopRecording(PluginCall call) {
         try {
+            long startedAt = ForegroundRecordingService.getStartedAt();
             File file = ForegroundRecordingService.stopActiveRecording();
             JSObject result = new JSObject();
             result.put("path", file.getAbsolutePath());
             result.put("name", file.getName());
             result.put("mimeType", "audio/mp4");
+            result.put("durationMs", startedAt > 0 ? System.currentTimeMillis() - startedAt : 0);
+            result.put("sizeBytes", file.exists() ? file.length() : 0);
             call.resolve(result);
         } catch (Exception error) {
             call.reject(error.getMessage());

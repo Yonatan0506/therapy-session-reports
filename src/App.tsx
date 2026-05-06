@@ -61,8 +61,9 @@ declare global {
           signOut?: () => Promise<void>;
         };
         NativeRecorder?: {
-          startRecording: () => Promise<{ recording: boolean }>;
-          stopRecording: () => Promise<{ path: string; name: string; mimeType: string }>;
+          startRecording: () => Promise<{ recording: boolean; startedAt?: number }>;
+          getStatus?: () => Promise<{ recording: boolean; startedAt?: number; sizeBytes?: number; lastError?: string }>;
+          stopRecording: () => Promise<{ path: string; name: string; mimeType: string; durationMs?: number; sizeBytes?: number }>;
         };
       };
     };
@@ -689,17 +690,22 @@ function NewSessionView(props: {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
+  const nativeStartedAtRef = useRef<number | null>(null);
 
   async function startRecording() {
     try {
       if (isNativeRecorderAvailable()) {
-        await window.Capacitor!.Plugins!.NativeRecorder!.startRecording();
+        const result = await window.Capacitor!.Plugins!.NativeRecorder!.startRecording();
+        const startedAt = result.startedAt || Date.now();
+        nativeStartedAtRef.current = startedAt;
         setRecordedBlob(null);
         setSeconds(0);
         setNativeRecording(true);
         setRecording(true);
         setRecordingMessage("הקלטה Native פעילה. אפשר לכבות מסך, אך אין לסגור את האפליקציה.");
-        timerRef.current = window.setInterval(() => setSeconds((value) => value + 1), 1000);
+        timerRef.current = window.setInterval(() => {
+          setSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+        }, 1000);
         return;
       }
 
@@ -740,11 +746,17 @@ function NewSessionView(props: {
         const response = await fetch(webPath);
         const blob = await response.blob();
         setRecordedBlob(new Blob([blob], { type: result.mimeType || "audio/mp4" }));
-        setRecordingMessage("הקלטת Native נשמרה זמנית ומוכנה לעיבוד.");
+        const durationSeconds = result.durationMs ? Math.round(result.durationMs / 1000) : 0;
+        const sizeMb = result.sizeBytes ? (result.sizeBytes / 1024 / 1024).toFixed(1) : "";
+        setSeconds(durationSeconds || seconds);
+        setRecordingMessage(
+          `הקלטת Native נשמרה זמנית ומוכנה לעיבוד.${durationSeconds ? ` משך בפועל: ${formatDuration(durationSeconds)}.` : ""}${sizeMb ? ` גודל: ${sizeMb}MB.` : ""}`
+        );
       } catch (error) {
         setRecordingMessage(error instanceof Error ? error.message : "לא הצלחנו לעצור הקלטה Native.");
       }
       setNativeRecording(false);
+      nativeStartedAtRef.current = null;
     } else {
       mediaRecorderRef.current?.stop();
     }
@@ -899,6 +911,13 @@ function audioExtensionFromMime(mimeType: string) {
   if (mimeType.includes("ogg")) return "ogg";
   if (mimeType.includes("webm")) return "webm";
   return "audio";
+}
+
+function formatDuration(totalSeconds: number) {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return [hours, minutes, seconds].map((value) => String(value).padStart(2, "0")).join(":");
 }
 
 function buildFailedSession(session: TherapySession, message: string, status: TherapySession["processingStatus"]): TherapySession {
