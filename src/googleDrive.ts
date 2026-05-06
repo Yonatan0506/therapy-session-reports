@@ -94,7 +94,7 @@ export async function syncTherapyDataToDrive(payload: {
   await uploadJsonFile(payload.accessToken, folderId, "sessions_index.json", payload.sessions);
 
   for (const patient of payload.patients) {
-    const patientFolderId = await ensureChildFolder(payload.accessToken, patientsFolderId, `patient_${patient.patientId}`);
+    const patientFolderId = await ensurePatientFolder(payload.accessToken, patientsFolderId, patient.patientId, patient.displayName);
     const sessionsFolderId = await ensureChildFolder(payload.accessToken, patientFolderId, "sessions");
     await ensureChildFolder(payload.accessToken, patientFolderId, "exports");
     await uploadJsonFile(payload.accessToken, patientFolderId, "patient.json", patient);
@@ -130,7 +130,7 @@ export async function uploadDocxToDrive(accessToken: string, fileName: string, b
 export async function uploadSessionDocxToDrive(accessToken: string, session: TherapySession, blob: Blob) {
   const folderId = await ensureAppFolder(accessToken);
   const patientsFolderId = await ensureChildFolder(accessToken, folderId, "patients");
-  const patientFolderId = await ensureChildFolder(accessToken, patientsFolderId, `patient_${session.patientId}`);
+  const patientFolderId = await ensurePatientFolder(accessToken, patientsFolderId, session.patientId, session.patientDisplayName);
   const exportsFolderId = await ensureChildFolder(accessToken, patientFolderId, "exports");
   await uploadBlobFile(
     accessToken,
@@ -145,7 +145,7 @@ export async function uploadSessionDocxToDrive(accessToken: string, session: The
 export async function uploadSessionAudioToDrive(accessToken: string, session: TherapySession, blob: Blob, fileName: string) {
   const folderId = await ensureAppFolder(accessToken);
   const patientsFolderId = await ensureChildFolder(accessToken, folderId, "patients");
-  const patientFolderId = await ensureChildFolder(accessToken, patientsFolderId, `patient_${session.patientId}`);
+  const patientFolderId = await ensurePatientFolder(accessToken, patientsFolderId, session.patientId, session.patientDisplayName);
   const audioFolderId = await ensureChildFolder(accessToken, patientFolderId, "audio");
   const mimeType = blob.type || "application/octet-stream";
   await uploadBlobFile(accessToken, audioFolderId, fileName, mimeType, blob);
@@ -155,7 +155,7 @@ export async function deleteSessionFromDrive(accessToken: string, session: Thera
   const folderId = await ensureAppFolder(accessToken);
   const patientsFolderId = await findFile(accessToken, folderId, "patients");
   if (patientsFolderId) {
-    const patientFolderId = await findFile(accessToken, patientsFolderId, `patient_${session.patientId}`);
+    const patientFolderId = await findPatientFolder(accessToken, patientsFolderId, session.patientId);
     if (patientFolderId) {
       const sessionsFolderId = await findFile(accessToken, patientFolderId, "sessions");
       const exportsFolderId = await findFile(accessToken, patientFolderId, "exports");
@@ -185,7 +185,7 @@ export async function deletePatientFromDrive(accessToken: string, patientId: str
   const folderId = await ensureAppFolder(accessToken);
   const patientsFolderId = await findFile(accessToken, folderId, "patients");
   if (!patientsFolderId) return;
-  const patientFolderId = await findFile(accessToken, patientsFolderId, `patient_${patientId}`);
+  const patientFolderId = await findPatientFolder(accessToken, patientsFolderId, patientId);
   if (patientFolderId) await deleteDriveFile(accessToken, patientFolderId);
 }
 
@@ -335,6 +335,48 @@ async function ensureChildFolder(accessToken: string, parentId: string, name: st
   return created.id as string;
 }
 
+async function ensurePatientFolder(accessToken: string, patientsFolderId: string, patientId: string, displayName: string) {
+  const readableName = buildPatientFolderName(patientId, displayName);
+  const existingReadable = await findFile(accessToken, patientsFolderId, readableName);
+  if (existingReadable) return existingReadable;
+
+  const existingLegacy = await findFile(accessToken, patientsFolderId, `patient_${patientId}`);
+  if (existingLegacy) {
+    await renameDriveFile(accessToken, existingLegacy, readableName);
+    return existingLegacy;
+  }
+
+  const existingById = await findPatientFolder(accessToken, patientsFolderId, patientId);
+  if (existingById) {
+    await renameDriveFile(accessToken, existingById, readableName);
+    return existingById;
+  }
+
+  return ensureChildFolder(accessToken, patientsFolderId, readableName);
+}
+
+async function findPatientFolder(accessToken: string, patientsFolderId: string, patientId: string) {
+  const query = encodeURIComponent(
+    `mimeType='application/vnd.google-apps.folder' and '${patientsFolderId}' in parents and trashed=false`
+  );
+  const result = await driveFetch(accessToken, `/drive/v3/files?q=${query}&fields=files(id,name)`);
+  const folders = (result.files || []) as Array<{ id: string; name: string }>;
+  return folders.find((folder) => folder.name === `patient_${patientId}` || folder.name.endsWith(`_${patientId}`))?.id;
+}
+
+function buildPatientFolderName(patientId: string, displayName: string) {
+  const safeName = sanitizeDriveName(displayName || "מטופל");
+  return `patient_${safeName}_${patientId}`;
+}
+
+function sanitizeDriveName(value: string) {
+  return value
+    .replace(/[\\/:*?"<>|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80) || "מטופל";
+}
+
 async function uploadJsonFile(accessToken: string, folderId: string, fileName: string, data: unknown) {
   await uploadBlobFile(accessToken, folderId, fileName, "application/json", new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
 }
@@ -405,6 +447,14 @@ async function findFile(accessToken: string, folderId: string, fileName: string)
 
 async function deleteDriveFile(accessToken: string, fileId: string) {
   await driveFetch(accessToken, `/drive/v3/files/${fileId}`, { method: "DELETE" });
+}
+
+async function renameDriveFile(accessToken: string, fileId: string, name: string) {
+  await driveFetch(accessToken, `/drive/v3/files/${fileId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name })
+  });
 }
 
 async function driveFetch(accessToken: string, path: string, init: RequestInit = {}) {
