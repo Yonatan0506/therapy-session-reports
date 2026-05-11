@@ -13,7 +13,7 @@ export async function processAudioDraft(session: TherapySession, audioFile?: Fil
 
   let response: Response;
   try {
-    response = await fetch("/api/process-session", {
+    response = await fetch("/api/process-session-job", {
       method: "POST",
       body: formData
     });
@@ -27,7 +27,36 @@ export async function processAudioDraft(session: TherapySession, audioFile?: Fil
     throw new Error(message);
   }
 
-  return (await response.json()) as TherapySession;
+  const payload = (await response.json()) as { jobId?: string; result?: TherapySession };
+  if (payload.result) return payload.result;
+  if (!payload.jobId) throw new Error("לא התקבל מזהה עיבוד מהשרת.");
+
+  return pollProcessingJob(payload.jobId);
+}
+
+async function pollProcessingJob(jobId: string): Promise<TherapySession> {
+  const startedAt = Date.now();
+  const timeoutMs = 45 * 60 * 1000;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    await delay(4000);
+    const response = await fetch(`/api/process-session-job/${encodeURIComponent(jobId)}`);
+    const payload = await response.json().catch(() => null);
+
+    if (response.ok && payload?.status === "completed" && payload.result) {
+      return payload.result as TherapySession;
+    }
+
+    if (!response.ok || payload?.status === "failed") {
+      throw new Error(payload?.message || payload?.error || "processing_failed");
+    }
+  }
+
+  throw new Error("העיבוד נמשך יותר מדי זמן. אם סימנת שמירת אודיו, הקובץ נשמר ב-Google Drive ואפשר לנסות שוב מאוחר יותר.");
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export async function askSessionQuestion(payload: {

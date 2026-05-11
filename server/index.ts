@@ -16,6 +16,17 @@ const upload = multer({
 });
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const DIRECT_TRANSCRIBE_LIMIT_BYTES = Number(process.env.DIRECT_TRANSCRIBE_LIMIT_BYTES || 24 * 1024 * 1024);
+const PROCESSING_JOB_TTL_MS = Number(process.env.PROCESSING_JOB_TTL_MS || 2 * 60 * 60 * 1000);
+
+type ProcessingJob = {
+  status: "queued" | "processing" | "completed" | "failed";
+  createdAt: string;
+  updatedAt: string;
+  result?: unknown;
+  message?: string;
+};
+
+const processingJobs = new Map<string, ProcessingJob>();
 
 app.use(express.json({ limit: "10mb" }));
 
@@ -104,6 +115,54 @@ app.post("/api/process-session", upload.single("audio"), async (req, res) => {
     console.error("processing_failed", message);
     res.status(500).json({ error: "processing_failed", message });
   }
+});
+
+app.post("/api/process-session-job", upload.single("audio"), async (req, res) => {
+  const session = parseSession(req.body?.session);
+
+  if (!req.file) {
+    res.status(400).json({
+      error: "missing_audio",
+      message: "לא צורף קובץ אודיו לעיבוד. יש להקליט ולעצור את ההקלטה לפני הפקת דו״ח, או להעלות קובץ אודיו."
+    });
+    return;
+  }
+
+  if (!openai) {
+    res.status(500).json({
+      error: "missing_openai_key",
+      message: "OPENAI_API_KEY לא נטען בשרת. יש לבדוק את משתני הסביבה ב-Render."
+    });
+    return;
+  }
+
+  const jobId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const file = cloneUploadedFile(req.file);
+  processingJobs.set(jobId, { status: "queued", createdAt: now, updatedAt: now });
+  res.status(202).json({ jobId, status: "queued" });
+
+  void runProcessingJob(jobId, session, file);
+});
+
+app.get("/api/process-session-job/:jobId", (req, res) => {
+  const job = processingJobs.get(req.params.jobId);
+  if (!job) {
+    res.status(404).json({ error: "job_not_found", message: "עבודת העיבוד לא נמצאה. ייתכן שהשרת הופעל מחדש או שהעיבוד ישן מדי." });
+    return;
+  }
+
+  if (job.status === "completed") {
+    res.json({ status: job.status, result: job.result });
+    return;
+  }
+
+  if (job.status === "failed") {
+    res.status(500).json({ status: job.status, error: "processing_failed", message: job.message || "עיבוד האודיו נכשל." });
+    return;
+  }
+
+  res.json({ status: job.status });
 });
 
 app.post("/api/chat-session", async (req, res) => {
@@ -287,6 +346,66 @@ function buildDemoSession(session: any, now: string) {
       openQuestionsForNextSession: []
     },
     updatedAt: now
+  };
+}
+
+async function processSessionAudio(session: any, file: Express.Multer.File) {
+  const now = new Date().toISOString();
+  const fallback = buildDemoSession(session, now);
+  const transcript = await transcribeAudio(file);
+  let aiReport = normalizeAiReport(await createTherapyReport(session, transcript), transcript);
+  if (!reportLooksHebrew(aiReport)) {
+    aiReport = normalizeAiReport(await rewriteReportInHebrew(session, aiReport), transcript);
+  }
+
+  return {
+    ...session,
+    processingStatus: "completed",
+    audioStored: Boolean(session.audioStored),
+    audioFileName: session.audioFileName,
+    audioMimeType: session.audioMimeType,
+    report: {
+      title: "דו״ח סיכום פגישה טיפולית",
+      meetingTopic: aiReport.meetingTopic || "",
+      sessionNarrative: aiReport.sessionNarrative || "",
+      therapeuticInsights: aiReport.therapeuticInsights || "",
+      followUpPoints: Array.isArray(aiReport.followUpPoints) ? aiReport.followUpPoints : [],
+      administrativeNotes: aiReport.administrativeNotes || "",
+      crmSummary: aiReport.crmSummary || ""
+    },
+    internalSessionMemory: aiReport.internalSessionMemory || fallback.internalSessionMemory,
+    updatedAt: now
+  };
+}
+
+async function runProcessingJob(jobId: string, session: any, file: Express.Multer.File) {
+  updateProcessingJob(jobId, { status: "processing" });
+  try {
+    const result = await processSessionAudio(session, file);
+    updateProcessingJob(jobId, { status: "completed", result });
+  } catch (error) {
+    const message = getSafeErrorMessage(error);
+    console.error("processing_job_failed", jobId, message);
+    updateProcessingJob(jobId, { status: "failed", message });
+  } finally {
+    setTimeout(() => processingJobs.delete(jobId), PROCESSING_JOB_TTL_MS).unref?.();
+  }
+}
+
+function updateProcessingJob(jobId: string, patch: Partial<ProcessingJob>) {
+  const current = processingJobs.get(jobId);
+  if (!current) return;
+  processingJobs.set(jobId, {
+    ...current,
+    ...patch,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function cloneUploadedFile(file: Express.Multer.File): Express.Multer.File {
+  return {
+    ...file,
+    buffer: Buffer.from(file.buffer)
   };
 }
 
