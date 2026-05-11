@@ -787,39 +787,47 @@ function NewSessionView(props: {
       participants,
       sessionType
     });
+    let sessionForProcessing = session;
+    let storedAudioMeta: Pick<TherapySession, "audioStored" | "audioFileName" | "audioMimeType"> | null = null;
     setIsProcessing(true);
     try {
-      const completed = await processAudioDraft({ ...session, processingStatus: "processing" }, audio);
-      let finalSession = completed;
       if (saveOriginalAudio && props.googleAccessToken) {
-        try {
-          const audioFileName = buildAudioFileName(completed, audio, file?.name);
-          await uploadSessionAudioToDrive(props.googleAccessToken, completed, audio, audioFileName);
-          finalSession = {
-            ...completed,
-            audioStored: true,
-            audioFileName,
-            audioMimeType: audio.type || "application/octet-stream",
-            updatedAt: new Date().toISOString()
-          };
-          setRecordingMessage("קובץ האודיו המקורי נשמר ב-Google Drive.");
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "שמירת האודיו ל-Google Drive נכשלה.";
-          setRecordingMessage(`הדוח הופק, אך האודיו לא נשמר: ${message}`);
-        }
+        const audioFileName = buildAudioFileName(session, audio, file?.name);
+        await uploadSessionAudioToDrive(props.googleAccessToken, session, audio, audioFileName);
+        storedAudioMeta = {
+          audioStored: true,
+          audioFileName,
+          audioMimeType: audio.type || "application/octet-stream"
+        };
+        sessionForProcessing = {
+          ...session,
+          ...storedAudioMeta,
+          updatedAt: new Date().toISOString()
+        };
+        setRecordingMessage("קובץ האודיו המקורי נשמר ב-Google Drive. ממשיך לעיבוד הדוח.");
       }
-      await deletePendingAudio(session.sessionId);
+
+      const completed = await processAudioDraft({ ...sessionForProcessing, processingStatus: "processing" }, audio);
+      let finalSession = completed;
+      if (storedAudioMeta) {
+        finalSession = {
+          ...completed,
+          ...storedAudioMeta,
+          updatedAt: new Date().toISOString()
+        };
+      }
+      await deletePendingAudio(sessionForProcessing.sessionId);
       props.onSaved(finalSession);
     } catch (error) {
       if (audio) {
-        await savePendingAudio(session.sessionId, audio, {
-          patientDisplayName: session.patientDisplayName,
-          sessionDate: session.sessionDate,
-          sourceType: session.sourceType
+        await savePendingAudio(sessionForProcessing.sessionId, audio, {
+          patientDisplayName: sessionForProcessing.patientDisplayName,
+          sessionDate: sessionForProcessing.sessionDate,
+          sourceType: sessionForProcessing.sourceType
         });
       }
       const message = error instanceof Error ? error.message : "לא הצלחנו להפיק דו״ח. אפשר לנסות שוב.";
-      props.onSaved(buildFailedSession(session, message, navigator.onLine ? "failed" : "pending"));
+      props.onSaved(buildFailedSession(sessionForProcessing, message, navigator.onLine ? "failed" : "pending"));
     } finally {
       setIsProcessing(false);
     }

@@ -15,6 +15,7 @@ const upload = multer({
   limits: { fileSize: 150 * 1024 * 1024 }
 });
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+const DIRECT_TRANSCRIBE_LIMIT_BYTES = Number(process.env.DIRECT_TRANSCRIBE_LIMIT_BYTES || 24 * 1024 * 1024);
 
 app.use(express.json({ limit: "10mb" }));
 
@@ -292,22 +293,23 @@ function buildDemoSession(session: any, now: string) {
 async function transcribeAudio(file: Express.Multer.File) {
   if (!openai) throw new Error("missing_openai_client");
 
+  if (file.size <= DIRECT_TRANSCRIBE_LIMIT_BYTES && isDirectTranscriptionMime(file.mimetype)) {
+    const transcription = await transcribeBuffer(
+      file.buffer,
+      file.originalname || `recording${extensionFromMime(file.mimetype) || ".m4a"}`,
+      file.mimetype,
+      "תמלול קובץ מלא"
+    );
+    return typeof transcription === "string" ? transcription : String(transcription);
+  }
+
   const chunks = await createAudioChunks(file);
   const transcripts: string[] = [];
 
   try {
     for (const [index, chunk] of chunks.entries()) {
       const buffer = await readFile(chunk);
-      const openAiFile = await toFile(buffer, path.basename(chunk), { type: "audio/mpeg" });
-      const transcription = await withOpenAiRetry(
-        () =>
-          openai.audio.transcriptions.create({
-            file: openAiFile,
-            model: process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe",
-            response_format: "text"
-          }),
-        `תמלול מקטע ${index + 1}`
-      );
+      const transcription = await transcribeBuffer(buffer, path.basename(chunk), "audio/mpeg", `תמלול מקטע ${index + 1}`);
 
       const text = typeof transcription === "string" ? transcription : String(transcription);
       transcripts.push(`[מקטע ${index + 1}]\n${text}`);
@@ -317,6 +319,20 @@ async function transcribeAudio(file: Express.Multer.File) {
   }
 
   return transcripts.join("\n\n");
+}
+
+async function transcribeBuffer(buffer: Buffer, fileName: string, mimeType: string, label: string) {
+  if (!openai) throw new Error("missing_openai_client");
+  const openAiFile = await toFile(buffer, fileName, { type: mimeType });
+  return withOpenAiRetry(
+    () =>
+      openai.audio.transcriptions.create({
+        file: openAiFile,
+        model: process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe",
+        response_format: "text"
+      }),
+    label
+  );
 }
 
 async function createAudioChunks(file: Express.Multer.File) {
@@ -400,6 +416,10 @@ function extensionFromMime(mimeType: string) {
   if (mimeType.includes("ogg")) return ".ogg";
   if (mimeType.includes("webm")) return ".webm";
   return "";
+}
+
+function isDirectTranscriptionMime(mimeType: string) {
+  return Boolean(extensionFromMime(mimeType));
 }
 
 async function createTherapyReport(session: any, transcript: string) {
