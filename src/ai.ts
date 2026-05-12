@@ -1,5 +1,8 @@
 import type { TherapySession } from "./types";
 
+const DEFAULT_REMOTE_API_BASE = "https://therapy-session-reports.onrender.com";
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
+
 export async function processAudioDraft(session: TherapySession, audioFile?: File | Blob): Promise<TherapySession> {
   const formData = new FormData();
   formData.set("session", JSON.stringify(session));
@@ -13,12 +16,14 @@ export async function processAudioDraft(session: TherapySession, audioFile?: Fil
 
   let response: Response;
   try {
-    response = await fetch("/api/process-session-job", {
+    await warmProcessingServer();
+    response = await fetch(apiUrl("/api/process-session-job"), {
       method: "POST",
       body: formData
     });
-  } catch {
-    throw new Error("לא הצלחנו להתחבר לשרת העיבוד. בדוק חיבור אינטרנט, המתן רגע ונסה שוב. אם זו הקלטה ארוכה, מומלץ לוודא שהטלפון לא במצב חיסכון בסוללה.");
+  } catch (error) {
+    const detail = error instanceof Error && error.message ? ` פרטים: ${error.message}` : "";
+    throw new Error(`לא הצלחנו להתחבר לשרת העיבוד. בדוק שיש אינטרנט ונסה שוב בעוד דקה. אם זו הקלטה ארוכה, ודא שהמסך נשאר פתוח בזמן העלאת הקובץ.${detail}`);
   }
 
   if (!response.ok) {
@@ -40,7 +45,7 @@ async function pollProcessingJob(jobId: string): Promise<TherapySession> {
 
   while (Date.now() - startedAt < timeoutMs) {
     await delay(4000);
-    const response = await fetch(`/api/process-session-job/${encodeURIComponent(jobId)}`);
+    const response = await fetch(apiUrl(`/api/process-session-job/${encodeURIComponent(jobId)}`), { cache: "no-store" });
     const payload = await response.json().catch(() => null);
 
     if (response.ok && payload?.status === "completed" && payload.result) {
@@ -59,12 +64,35 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function warmProcessingServer() {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(apiUrl("/api/health"), {
+      cache: "no-store",
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`health ${response.status}`);
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function apiUrl(path: string) {
+  const base = API_BASE_URL || (isNativeOrFileOrigin() ? DEFAULT_REMOTE_API_BASE : "");
+  return base ? `${base}${path}` : path;
+}
+
+function isNativeOrFileOrigin() {
+  return window.location.protocol === "capacitor:" || window.location.protocol === "file:";
+}
+
 export async function askSessionQuestion(payload: {
   question: string;
   session: TherapySession;
   previousSessions?: TherapySession[];
 }): Promise<string> {
-  const response = await fetch("/api/chat-session", {
+  const response = await fetch(apiUrl("/api/chat-session"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -84,7 +112,7 @@ export async function createProgressSummary(payload: {
   dateTo: string;
   sessions: TherapySession[];
 }): Promise<string> {
-  const response = await fetch("/api/progress-summary", {
+  const response = await fetch(apiUrl("/api/progress-summary"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
