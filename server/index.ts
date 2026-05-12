@@ -413,13 +413,19 @@ async function transcribeAudio(file: Express.Multer.File) {
   if (!openai) throw new Error("missing_openai_client");
 
   if (file.size <= DIRECT_TRANSCRIBE_LIMIT_BYTES && isDirectTranscriptionMime(file.mimetype)) {
-    const transcription = await transcribeBuffer(
-      file.buffer,
-      file.originalname || `recording${extensionFromMime(file.mimetype) || ".m4a"}`,
-      file.mimetype,
-      "תמלול קובץ מלא"
-    );
-    return typeof transcription === "string" ? transcription : String(transcription);
+    try {
+      const transcription = await transcribeBuffer(
+        file.buffer,
+        ensureAudioFileName(file.originalname, file.mimetype),
+        file.mimetype,
+        "תמלול קובץ מלא"
+      );
+      return typeof transcription === "string" ? transcription : String(transcription);
+    } catch (error) {
+      const message = getSafeErrorMessage(error);
+      if (!isUnsupportedAudioError(message)) throw error;
+      console.warn("direct_transcription_failed_trying_ffmpeg", message);
+    }
   }
 
   const chunks = await createAudioChunks(file);
@@ -537,8 +543,21 @@ function extensionFromMime(mimeType: string) {
   return "";
 }
 
+function ensureAudioFileName(fileName: string | undefined, mimeType: string) {
+  const extension = extensionFromMime(mimeType) || ".webm";
+  const cleanName = fileName?.trim();
+  if (!cleanName) return `recording${extension}`;
+  if (path.extname(cleanName)) return cleanName;
+  return `${cleanName}${extension}`;
+}
+
 function isDirectTranscriptionMime(mimeType: string) {
   return Boolean(extensionFromMime(mimeType));
+}
+
+function isUnsupportedAudioError(message: string) {
+  const lower = message.toLowerCase();
+  return lower.includes("corrupted") || lower.includes("unsupported") || lower.includes("invalid file format");
 }
 
 async function createTherapyReport(session: any, transcript: string) {

@@ -10,7 +10,9 @@ export async function processAudioDraft(session: TherapySession, audioFile?: Fil
     const file =
       audioFile instanceof File
         ? audioFile
-        : new File([audioFile], `recording-${session.sessionId}.webm`, { type: audioFile.type || "audio/webm" });
+        : new File([audioFile], `recording-${session.sessionId}.${audioExtensionFromMime(audioFile.type)}`, {
+            type: audioFile.type || "audio/webm"
+          });
     formData.set("audio", file);
   }
 
@@ -85,6 +87,15 @@ function apiUrl(path: string) {
 
 function isNativeOrFileOrigin() {
   return window.location.protocol === "capacitor:" || window.location.protocol === "file:";
+}
+
+function audioExtensionFromMime(mimeType: string) {
+  if (mimeType.includes("mp4") || mimeType.includes("m4a")) return "m4a";
+  if (mimeType.includes("mpeg") || mimeType.includes("mp3")) return "mp3";
+  if (mimeType.includes("wav")) return "wav";
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("webm")) return "webm";
+  return "webm";
 }
 
 export async function askSessionQuestion(payload: {
