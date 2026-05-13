@@ -793,18 +793,26 @@ function NewSessionView(props: {
     try {
       if (saveOriginalAudio && props.googleAccessToken) {
         const audioFileName = buildAudioFileName(session, audio, file?.name);
-        await uploadSessionAudioToDrive(props.googleAccessToken, session, audio, audioFileName);
-        storedAudioMeta = {
-          audioStored: true,
-          audioFileName,
-          audioMimeType: audio.type || "application/octet-stream"
-        };
-        sessionForProcessing = {
-          ...session,
-          ...storedAudioMeta,
-          updatedAt: new Date().toISOString()
-        };
-        setRecordingMessage("קובץ האודיו המקורי נשמר ב-Google Drive. ממשיך לעיבוד הדוח.");
+        try {
+          await uploadSessionAudioToDrive(props.googleAccessToken, session, audio, audioFileName);
+          storedAudioMeta = {
+            audioStored: true,
+            audioFileName,
+            audioMimeType: audio.type || "application/octet-stream"
+          };
+          sessionForProcessing = {
+            ...session,
+            ...storedAudioMeta,
+            updatedAt: new Date().toISOString()
+          };
+          setRecordingMessage("קובץ האודיו המקורי נשמר ב-Google Drive. ממשיך לעיבוד הדוח.");
+        } catch (error) {
+          if (isGoogleAuthError(error)) {
+            disconnectGoogleDrive();
+          }
+          const message = error instanceof Error ? error.message : "שמירת האודיו ל-Google Drive נכשלה.";
+          setRecordingMessage(`שמירת האודיו ל-Google Drive נכשלה, אבל ממשיכים להפיק דוח. לאחר מכן חבר Google Drive מחדש. ${message}`);
+        }
       }
 
       const completed = await processAudioDraft({ ...sessionForProcessing, processingStatus: "processing" }, audio);
