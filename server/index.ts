@@ -15,7 +15,7 @@ const upload = multer({
   limits: { fileSize: 150 * 1024 * 1024 }
 });
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
-const DIRECT_TRANSCRIBE_LIMIT_BYTES = Number(process.env.DIRECT_TRANSCRIBE_LIMIT_BYTES || 24 * 1024 * 1024);
+const DIRECT_TRANSCRIBE_LIMIT_BYTES = Number(process.env.DIRECT_TRANSCRIBE_LIMIT_BYTES || 8 * 1024 * 1024);
 const PROCESSING_JOB_TTL_MS = Number(process.env.PROCESSING_JOB_TTL_MS || 2 * 60 * 60 * 1000);
 
 type ProcessingJob = {
@@ -423,7 +423,7 @@ async function transcribeAudio(file: Express.Multer.File) {
       return typeof transcription === "string" ? transcription : String(transcription);
     } catch (error) {
       const message = getSafeErrorMessage(error);
-      if (!isUnsupportedAudioError(message)) throw error;
+      if (!isUnsupportedAudioError(message) && !isDirectAudioTooLargeError(message)) throw error;
       console.warn("direct_transcription_failed_trying_ffmpeg", message);
     }
   }
@@ -558,6 +558,11 @@ function isDirectTranscriptionMime(mimeType: string) {
 function isUnsupportedAudioError(message: string) {
   const lower = message.toLowerCase();
   return lower.includes("corrupted") || lower.includes("unsupported") || lower.includes("invalid file format");
+}
+
+function isDirectAudioTooLargeError(message: string) {
+  const lower = message.toLowerCase();
+  return lower.includes("tokens") && lower.includes("audio") && lower.includes("too large");
 }
 
 async function createTherapyReport(session: any, transcript: string) {
