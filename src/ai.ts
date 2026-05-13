@@ -43,19 +43,44 @@ export async function processAudioDraft(session: TherapySession, audioFile?: Fil
 
 async function pollProcessingJob(jobId: string): Promise<TherapySession> {
   const startedAt = Date.now();
-  const timeoutMs = 45 * 60 * 1000;
+  const timeoutMs = 90 * 60 * 1000;
+  let transientFailures = 0;
+  const maxTransientFailures = 60;
 
   while (Date.now() - startedAt < timeoutMs) {
     await delay(4000);
-    const response = await fetch(apiUrl(`/api/process-session-job/${encodeURIComponent(jobId)}`), { cache: "no-store" });
-    const payload = await response.json().catch(() => null);
+    let response: Response;
+    let payload: any = null;
+
+    try {
+      response = await fetch(apiUrl(`/api/process-session-job/${encodeURIComponent(jobId)}`), { cache: "no-store" });
+      payload = await response.json().catch(() => null);
+      transientFailures = 0;
+    } catch (error) {
+      transientFailures += 1;
+      if (transientFailures > maxTransientFailures) {
+        const detail = error instanceof Error && error.message ? ` פרטים: ${error.message}` : "";
+        throw new Error(`העיבוד עדיין לא הסתיים, אבל החיבור לבדיקת הסטטוס נפל שוב ושוב.${detail}`);
+      }
+      continue;
+    }
 
     if (response.ok && payload?.status === "completed" && payload.result) {
       return payload.result as TherapySession;
     }
 
-    if (!response.ok || payload?.status === "failed") {
+    if (payload?.status === "failed") {
       throw new Error(payload?.message || payload?.error || "processing_failed");
+    }
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error(payload?.message || "עבודת העיבוד לא נמצאה. ייתכן שהשרת הופעל מחדש בזמן העיבוד.");
+      }
+      transientFailures += 1;
+      if (transientFailures > maxTransientFailures) {
+        throw new Error(payload?.message || payload?.error || `בדיקת סטטוס העיבוד נכשלה שוב ושוב (${response.status}).`);
+      }
     }
   }
 
