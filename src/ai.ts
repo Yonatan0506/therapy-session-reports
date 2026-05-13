@@ -2,17 +2,18 @@ import type { TherapySession } from "./types";
 
 const DEFAULT_REMOTE_API_BASE = "https://therapy-session-reports.onrender.com";
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
+const CHUNKED_UPLOAD_THRESHOLD_BYTES = 6 * 1024 * 1024;
+const AUDIO_UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 
 export async function processAudioDraft(session: TherapySession, audioFile?: File | Blob): Promise<TherapySession> {
+  const file = audioFile ? normalizeAudioFile(session, audioFile) : null;
+  if (file && file.size > CHUNKED_UPLOAD_THRESHOLD_BYTES) {
+    return processAudioDraftChunked(session, file);
+  }
+
   const formData = new FormData();
   formData.set("session", JSON.stringify(session));
-  if (audioFile) {
-    const file =
-      audioFile instanceof File
-        ? audioFile
-        : new File([audioFile], `recording-${session.sessionId}.${audioExtensionFromMime(audioFile.type)}`, {
-            type: audioFile.type || "audio/webm"
-          });
+  if (file) {
     formData.set("audio", file);
   }
 
@@ -39,6 +40,69 @@ export async function processAudioDraft(session: TherapySession, audioFile?: Fil
   if (!payload.jobId) throw new Error("לא התקבל מזהה עיבוד מהשרת.");
 
   return pollProcessingJob(payload.jobId);
+}
+
+async function processAudioDraftChunked(session: TherapySession, file: File): Promise<TherapySession> {
+  try {
+    await warmProcessingServer();
+    const startResponse = await fetch(apiUrl("/api/process-session-upload"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session,
+        fileName: file.name,
+        mimeType: file.type || "application/octet-stream",
+        size: file.size
+      })
+    });
+
+    const startPayload = await startResponse.json().catch(() => null);
+    if (!startResponse.ok || !startPayload?.jobId) {
+      throw new Error(startPayload?.message || startPayload?.error || "upload_start_failed");
+    }
+
+    const jobId = String(startPayload.jobId);
+    for (let offset = 0; offset < file.size; offset += AUDIO_UPLOAD_CHUNK_BYTES) {
+      const chunk = file.slice(offset, Math.min(offset + AUDIO_UPLOAD_CHUNK_BYTES, file.size));
+      await uploadAudioChunkWithRetry(jobId, chunk);
+    }
+
+    const completeResponse = await fetch(apiUrl(`/api/process-session-upload/${encodeURIComponent(jobId)}/complete`), {
+      method: "POST"
+    });
+    const completePayload = await completeResponse.json().catch(() => null);
+    if (!completeResponse.ok) {
+      throw new Error(completePayload?.message || completePayload?.error || "upload_complete_failed");
+    }
+
+    return pollProcessingJob(jobId);
+  } catch (error) {
+    const detail = error instanceof Error && error.message ? ` פרטים: ${error.message}` : "";
+    throw new Error(`לא הצלחנו להעלות את ההקלטה הארוכה לשרת העיבוד.${detail}`);
+  }
+}
+
+async function uploadAudioChunkWithRetry(jobId: string, chunk: Blob) {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try {
+      const response = await fetch(apiUrl(`/api/process-session-upload/${encodeURIComponent(jobId)}/chunk`), {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: chunk
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.message || payload?.error || `chunk_upload_failed_${response.status}`);
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      await delay(1000 * attempt);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("chunk_upload_failed");
 }
 
 async function pollProcessingJob(jobId: string): Promise<TherapySession> {
@@ -112,6 +176,13 @@ function apiUrl(path: string) {
 
 function isNativeOrFileOrigin() {
   return window.location.protocol === "capacitor:" || window.location.protocol === "file:";
+}
+
+function normalizeAudioFile(session: TherapySession, audioFile: File | Blob) {
+  if (audioFile instanceof File && audioFile.name) return audioFile;
+  return new File([audioFile], `recording-${session.sessionId}.${audioExtensionFromMime(audioFile.type)}`, {
+    type: audioFile.type || "audio/webm"
+  });
 }
 
 function audioExtensionFromMime(mimeType: string) {

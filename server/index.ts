@@ -6,7 +6,7 @@ import { toFile } from "openai/uploads";
 import ffmpegPath from "ffmpeg-static";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const app = express();
@@ -27,6 +27,15 @@ type ProcessingJob = {
 };
 
 const processingJobs = new Map<string, ProcessingJob>();
+const uploadJobs = new Map<string, {
+  session: any;
+  filePath: string;
+  originalname: string;
+  mimetype: string;
+  size: number;
+  receivedBytes: number;
+  createdAt: string;
+}>();
 
 app.use(express.json({ limit: "10mb" }));
 
@@ -143,6 +152,80 @@ app.post("/api/process-session-job", upload.single("audio"), async (req, res) =>
   res.status(202).json({ jobId, status: "queued" });
 
   void runProcessingJob(jobId, session, file);
+});
+
+app.post("/api/process-session-upload", async (req, res) => {
+  const session = parseSession(req.body?.session);
+  const originalname = String(req.body?.fileName || `recording-${session.sessionId || crypto.randomUUID()}.m4a`);
+  const mimetype = String(req.body?.mimeType || "application/octet-stream");
+  const size = Number(req.body?.size || 0);
+
+  if (!openai) {
+    res.status(500).json({
+      error: "missing_openai_key",
+      message: "OPENAI_API_KEY לא נטען בשרת. יש לבדוק את משתני הסביבה ב-Render."
+    });
+    return;
+  }
+
+  const jobId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const uploadDir = await ensureUploadJobDir(jobId);
+  const filePath = path.join(uploadDir, "audio-upload");
+  await writeFile(filePath, Buffer.alloc(0));
+  processingJobs.set(jobId, { status: "queued", createdAt: now, updatedAt: now });
+  uploadJobs.set(jobId, {
+    session,
+    filePath,
+    originalname,
+    mimetype,
+    size,
+    receivedBytes: 0,
+    createdAt: now
+  });
+
+  res.status(202).json({ jobId, status: "uploading" });
+});
+
+app.post(
+  "/api/process-session-upload/:jobId/chunk",
+  express.raw({ type: "*/*", limit: "6mb" }),
+  async (req, res) => {
+    const uploadJob = uploadJobs.get(req.params.jobId);
+    if (!uploadJob) {
+      res.status(404).json({ error: "upload_not_found", message: "העלאת האודיו לא נמצאה. נסה להתחיל מחדש." });
+      return;
+    }
+
+    const chunk = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || []);
+    if (!chunk.length) {
+      res.status(400).json({ error: "empty_chunk", message: "התקבל מקטע אודיו ריק." });
+      return;
+    }
+
+    await appendFile(uploadJob.filePath, chunk);
+    uploadJob.receivedBytes += chunk.length;
+    res.json({ ok: true, receivedBytes: uploadJob.receivedBytes, expectedBytes: uploadJob.size });
+  }
+);
+
+app.post("/api/process-session-upload/:jobId/complete", async (req, res) => {
+  const uploadJob = uploadJobs.get(req.params.jobId);
+  if (!uploadJob) {
+    res.status(404).json({ error: "upload_not_found", message: "העלאת האודיו לא נמצאה. נסה להתחיל מחדש." });
+    return;
+  }
+
+  if (uploadJob.size && uploadJob.receivedBytes < uploadJob.size) {
+    res.status(400).json({
+      error: "incomplete_upload",
+      message: `העלאת האודיו לא הושלמה. התקבלו ${uploadJob.receivedBytes} מתוך ${uploadJob.size} בתים.`
+    });
+    return;
+  }
+
+  res.status(202).json({ jobId: req.params.jobId, status: "queued" });
+  void runUploadedProcessingJob(req.params.jobId);
 });
 
 app.get("/api/process-session-job/:jobId", (req, res) => {
@@ -392,6 +475,30 @@ async function runProcessingJob(jobId: string, session: any, file: Express.Multe
   }
 }
 
+async function runUploadedProcessingJob(jobId: string) {
+  const uploadJob = uploadJobs.get(jobId);
+  if (!uploadJob) {
+    updateProcessingJob(jobId, { status: "failed", message: "העלאת האודיו לא נמצאה." });
+    return;
+  }
+
+  updateProcessingJob(jobId, { status: "processing" });
+  try {
+    const buffer = await readFile(uploadJob.filePath);
+    const file = buildUploadedFile(uploadJob, buffer);
+    const result = await processSessionAudio(uploadJob.session, file);
+    updateProcessingJob(jobId, { status: "completed", result });
+  } catch (error) {
+    const message = getSafeErrorMessage(error);
+    console.error("uploaded_processing_job_failed", jobId, message);
+    updateProcessingJob(jobId, { status: "failed", message });
+  } finally {
+    uploadJobs.delete(jobId);
+    await cleanupUploadJobDir(jobId);
+    setTimeout(() => processingJobs.delete(jobId), PROCESSING_JOB_TTL_MS).unref?.();
+  }
+}
+
 function updateProcessingJob(jobId: string, patch: Partial<ProcessingJob>) {
   const current = processingJobs.get(jobId);
   if (!current) return;
@@ -407,6 +514,35 @@ function cloneUploadedFile(file: Express.Multer.File): Express.Multer.File {
     ...file,
     buffer: Buffer.from(file.buffer)
   };
+}
+
+function buildUploadedFile(uploadJob: NonNullable<ReturnType<typeof uploadJobs.get>>, buffer: Buffer): Express.Multer.File {
+  return {
+    fieldname: "audio",
+    originalname: uploadJob.originalname,
+    encoding: "7bit",
+    mimetype: uploadJob.mimetype,
+    size: buffer.length,
+    destination: "",
+    filename: uploadJob.originalname,
+    path: uploadJob.filePath,
+    buffer,
+    stream: undefined as any
+  };
+}
+
+async function ensureUploadJobDir(jobId: string) {
+  const root = path.join(process.cwd(), "server-tmp", "uploads");
+  const directory = path.join(root, jobId);
+  await mkdir(directory, { recursive: true });
+  return directory;
+}
+
+async function cleanupUploadJobDir(jobId: string) {
+  const directory = path.join(process.cwd(), "server-tmp", "uploads", jobId);
+  if (directory.startsWith(path.join(process.cwd(), "server-tmp", "uploads"))) {
+    await rm(directory, { recursive: true, force: true });
+  }
 }
 
 async function transcribeAudio(file: Express.Multer.File) {
