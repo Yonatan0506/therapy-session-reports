@@ -66,6 +66,12 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+app.get("/api/client-config", (_req, res) => {
+  res.json({
+    googleClientId: process.env.VITE_GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID || ""
+  });
+});
+
 app.get("/api/debug-openai", async (_req, res) => {
   if (!openai) {
     res.status(500).json({ ok: false, step: "config", message: "OPENAI_API_KEY לא נטען בשרת" });

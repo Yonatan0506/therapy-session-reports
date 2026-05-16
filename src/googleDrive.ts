@@ -1,7 +1,7 @@
 import type { Patient, TherapySession, UserProfile } from "./types";
 
 const APP_FOLDER_NAME = "Therapy Session Reports";
-const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
+let googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
 const GOOGLE_SCOPES = [
   "openid",
   "email",
@@ -34,11 +34,12 @@ declare global {
 }
 
 export function isGoogleConfigured() {
-  return Boolean(GOOGLE_CLIENT_ID);
+  return true;
 }
 
 export async function signInWithGoogle(): Promise<{ user: UserProfile; accessToken: string }> {
-  if (!GOOGLE_CLIENT_ID) {
+  const clientId = await getGoogleClientId();
+  if (!clientId) {
     throw new Error("חסר VITE_GOOGLE_CLIENT_ID בקובץ .env");
   }
 
@@ -47,7 +48,7 @@ export async function signInWithGoogle(): Promise<{ user: UserProfile; accessTok
   }
 
   await waitForGoogleIdentity();
-  const accessToken = await requestAccessToken();
+  const accessToken = await requestAccessToken(clientId);
   const profile = await fetchGoogleProfile(accessToken);
 
   const user: UserProfile = {
@@ -68,6 +69,25 @@ export async function signInWithGoogle(): Promise<{ user: UserProfile; accessTok
 
 export function getStoredAccessToken() {
   return sessionStorage.getItem("therapy:google-access-token") || "";
+}
+
+async function getGoogleClientId() {
+  if (googleClientId) return googleClientId;
+
+  try {
+    const response = await fetch("/api/client-config", { cache: "no-store" });
+    if (response.ok) {
+      const config = (await response.json()) as { googleClientId?: string };
+      if (config.googleClientId) {
+        googleClientId = config.googleClientId;
+        return googleClientId;
+      }
+    }
+  } catch {
+    // Static local builds may not have the backend config endpoint.
+  }
+
+  return googleClientId;
 }
 
 export function disconnectGoogleDrive() {
@@ -233,10 +253,10 @@ async function waitForGoogleIdentity() {
   throw new Error("Google Identity Services לא נטען בדפדפן");
 }
 
-function requestAccessToken() {
+function requestAccessToken(clientId: string) {
   return new Promise<string>((resolve, reject) => {
     const tokenClient = window.google!.accounts.oauth2.initTokenClient({
-      client_id: GOOGLE_CLIENT_ID!,
+      client_id: clientId,
       scope: GOOGLE_SCOPES,
       prompt: "consent",
       callback: (response) => {
