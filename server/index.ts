@@ -26,6 +26,7 @@ const upload = multer({
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const DIRECT_TRANSCRIBE_LIMIT_BYTES = Number(process.env.DIRECT_TRANSCRIBE_LIMIT_BYTES || 8 * 1024 * 1024);
 const PROCESSING_JOB_TTL_MS = Number(process.env.PROCESSING_JOB_TTL_MS || 2 * 60 * 60 * 1000);
+const PROCESSING_MODE = normalizeProcessingMode(process.env.PROCESSING_MODE);
 
 type ProcessingJob = {
   status: "queued" | "processing" | "completed" | "failed";
@@ -60,7 +61,8 @@ app.get("/api/health", (_req, res) => {
     ok: true,
     openai: Boolean(openai),
     ffmpeg: Boolean(ffmpegPath),
-    cloudStorage: isCloudStorageConfigured()
+    cloudStorage: isCloudStorageConfigured(),
+    processingMode: PROCESSING_MODE
   });
 });
 
@@ -265,7 +267,7 @@ app.get("/api/process-session-job/:jobId", async (req, res) => {
     return;
   }
 
-  if (isCloudStorageConfigured() && job.audioObjectName && (job.status === "queued" || job.status === "processing")) {
+  if (shouldRunCloudJobInline() && job.audioObjectName && (job.status === "queued" || job.status === "processing")) {
     void runCloudProcessingJob(req.params.jobId);
   }
 
@@ -280,6 +282,49 @@ app.get("/api/process-session-job/:jobId", async (req, res) => {
   }
 
   res.json({ status: job.status, stage: job.stage, message: job.message });
+});
+
+app.post("/api/internal/process-job", async (req, res) => {
+  if (!authorizeWorkerRequest(req)) {
+    res.status(401).json({ error: "unauthorized", message: "worker token is missing or invalid" });
+    return;
+  }
+
+  if (!isCloudStorageConfigured()) {
+    res.status(500).json({ error: "cloud_storage_not_configured", message: "Cloud Storage is required for worker processing." });
+    return;
+  }
+
+  if (!openai) {
+    res.status(500).json({ error: "missing_openai_key", message: "OPENAI_API_KEY is required for worker processing." });
+    return;
+  }
+
+  const jobId = String(req.body?.jobId || req.query?.jobId || "").trim();
+  if (!jobId) {
+    res.status(400).json({ error: "missing_job_id", message: "jobId is required." });
+    return;
+  }
+
+  const job = await getProcessingJob(jobId);
+  if (!job) {
+    res.status(404).json({ error: "job_not_found", message: "Processing job was not found." });
+    return;
+  }
+
+  if (job.status === "completed" || job.status === "failed") {
+    res.json({ jobId, status: job.status, stage: job.stage, message: job.message });
+    return;
+  }
+
+  await runCloudProcessingJob(jobId);
+  const updated = await getProcessingJob(jobId);
+  res.json({
+    jobId,
+    status: updated?.status || "unknown",
+    stage: updated?.stage,
+    message: updated?.message
+  });
 });
 
 app.post("/api/chat-session", async (req, res) => {
@@ -495,6 +540,23 @@ async function processSessionAudio(session: any, file: Express.Multer.File) {
   };
 }
 
+function normalizeProcessingMode(value: string | undefined) {
+  if (value === "inline" || value === "worker" || value === "hybrid") return value;
+  return "hybrid";
+}
+
+function shouldRunCloudJobInline() {
+  return isCloudStorageConfigured() && PROCESSING_MODE !== "worker";
+}
+
+function authorizeWorkerRequest(req: express.Request) {
+  const token = process.env.PROCESSING_WORKER_TOKEN;
+  if (!token) return process.env.NODE_ENV !== "production";
+  const headerToken = req.header("x-worker-token") || "";
+  const bearer = req.header("authorization")?.replace(/^Bearer\s+/i, "") || "";
+  return headerToken === token || bearer === token;
+}
+
 async function runCloudBackedJobFromFile(jobId: string, session: any, file: Express.Multer.File) {
   try {
     updateProcessingJob(jobId, { status: "processing", stage: "saving_audio_to_cloud" });
@@ -514,7 +576,9 @@ async function runCloudBackedJobFromFile(jobId: string, session: any, file: Expr
     };
     processingJobs.set(jobId, job);
     await persistProcessingJob(jobId, job);
-    void runCloudProcessingJob(jobId);
+    if (shouldRunCloudJobInline()) {
+      void runCloudProcessingJob(jobId);
+    }
   } catch (error) {
     const message = getSafeErrorMessage(error);
     console.error("cloud_job_prepare_failed", jobId, message);
@@ -550,7 +614,9 @@ async function runCloudBackedUploadedProcessingJob(jobId: string) {
     await persistProcessingJob(jobId, job);
     uploadJobs.delete(jobId);
     await cleanupUploadJobDir(jobId);
-    void runCloudProcessingJob(jobId);
+    if (shouldRunCloudJobInline()) {
+      void runCloudProcessingJob(jobId);
+    }
   } catch (error) {
     const message = getSafeErrorMessage(error);
     console.error("cloud_uploaded_job_prepare_failed", jobId, message);

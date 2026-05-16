@@ -35,6 +35,8 @@ GCS_BUCKET=therapy-session-audio-temp
 GOOGLE_CLOUD_CLIENT_EMAIL=service-account@project-id.iam.gserviceaccount.com
 GOOGLE_CLOUD_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 DELETE_CLOUD_AUDIO_AFTER_SUCCESS=true
+PROCESSING_MODE=hybrid
+PROCESSING_WORKER_TOKEN=replace-with-a-long-random-token
 ```
 
 יש להשאיר גם את המשתנים הקיימים:
@@ -85,6 +87,56 @@ therapy-session-audio-temp
 - Minimum instances: `0` כדי לחסוך כסף, או `1` אם רוצים פחות cold start
 
 הערה: גם אם Cloud Run מאפשר timeout עד 60 דקות, לא כדאי לסמוך על בקשת משתמש אחת ארוכה. לכן הקוד שומר אודיו וסטטוס בענן.
+
+## מצב Worker
+
+נוסף endpoint פנימי:
+
+```text
+POST /api/internal/process-job
+```
+
+הגוף:
+
+```json
+{
+  "jobId": "..."
+}
+```
+
+אם מוגדר `PROCESSING_WORKER_TOKEN`, צריך לשלוח אחד מאלה:
+
+```text
+x-worker-token: ...
+```
+
+או:
+
+```text
+Authorization: Bearer ...
+```
+
+בסביבת production חובה להגדיר `PROCESSING_WORKER_TOKEN`; בלי token הקריאה הפנימית תחזיר 401. זה מכוון, כדי שלא יהיה endpoint ציבורי שמפעיל עיבוד.
+
+מצבי עבודה:
+
+- `PROCESSING_MODE=hybrid`  
+  ברירת המחדל. השרת יוצר job וגם מנסה לעבד אותו בעצמו. זה המצב המתאים כרגע ל-Render ולבדיקות מעבר.
+
+- `PROCESSING_MODE=inline`  
+  כמו hybrid מבחינת העיבוד הנוכחי, מתאים לבדיקה פשוטה.
+
+- `PROCESSING_MODE=worker`  
+  השרת רק שומר את האודיו וה-job בענן. הוא לא מפעיל עיבוד בעצמו. במקרה כזה צריך Cloud Tasks, Cloud Run Job, או worker חיצוני שיקרא ל-`/api/internal/process-job`.
+
+המלצה למעבר הדרגתי:
+
+1. להשאיר ב-Render:
+   `PROCESSING_MODE=hybrid`
+2. לפרוס Cloud Run ראשון גם עם:
+   `PROCESSING_MODE=hybrid`
+3. אחרי שהכול עובד, להוסיף worker נפרד ולשנות את שירות ה-API ל:
+   `PROCESSING_MODE=worker`
 
 ## בדיקות קבלה
 
