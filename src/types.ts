@@ -49,6 +49,9 @@ export interface TherapySession {
   audioStored: boolean;
   audioFileName?: string;
   audioMimeType?: string;
+  processingJobId?: string;
+  processingStage?: string;
+  processingMessage?: string;
   processingStatus: ProcessingStatus;
   report: SessionReport;
   internalSessionMemory: InternalSessionMemory;

@@ -27,7 +27,7 @@ import {
   UsersRound
 } from "lucide-react";
 import { v4 as uuid } from "uuid";
-import { askSessionQuestion, createProgressSummary, processAudioDraft, type ProcessingUpdate } from "./ai";
+import { askSessionQuestion, createProgressSummary, processAudioDraft, resumeProcessingJob, type ProcessingUpdate } from "./ai";
 import {
   deletePatientFromDrive,
   deleteSessionFromDrive,
@@ -466,6 +466,10 @@ export function App() {
             upsertSession(session);
             setView("session");
           }}
+          onProcessingStarted={(session) => {
+            upsertSession(session);
+            setSelectedSessionId(session.sessionId);
+          }}
         />
       )}
 
@@ -673,6 +677,7 @@ function NewSessionView(props: {
   onCancel: () => void;
   onCreatePatient: (displayName: string) => Patient;
   onSaved: (session: TherapySession) => void;
+  onProcessingStarted: (session: TherapySession) => void;
 }) {
   const [patientName, setPatientName] = useState("");
   const [date, setDate] = useState(today());
@@ -841,7 +846,20 @@ function NewSessionView(props: {
       const completed = await processAudioDraft(
         { ...sessionForProcessing, processingStatus: "processing" },
         audio,
-        updateProcessingMessage
+        {
+          onUpdate: updateProcessingMessage,
+          onJobStarted: (jobId) => {
+            const processingSession: TherapySession = {
+              ...sessionForProcessing,
+              processingStatus: "processing",
+              processingJobId: jobId,
+              processingStage: "queued",
+              processingMessage: "ההקלטה נשלחה לעיבוד ברקע. אפשר לחזור לדוח מאוחר יותר ולבדוק אם הוא מוכן.",
+              updatedAt: new Date().toISOString()
+            };
+            props.onProcessingStarted(processingSession);
+          }
+        }
       );
       let finalSession = completed;
       if (storedAudioMeta) {
@@ -851,6 +869,12 @@ function NewSessionView(props: {
           updatedAt: new Date().toISOString()
         };
       }
+      finalSession = {
+        ...finalSession,
+        processingJobId: undefined,
+        processingStage: undefined,
+        processingMessage: undefined
+      };
       await deletePendingAudio(sessionForProcessing.sessionId);
       props.onSaved(finalSession);
     } catch (error) {
@@ -1007,6 +1031,7 @@ function SessionView(props: {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
+  const [isCheckingJob, setIsCheckingJob] = useState(false);
 
   function updateReport(key: keyof SessionReport, value: string | string[]) {
     setDraft({ ...draft, report: { ...draft.report, [key]: value }, updatedAt: new Date().toISOString() });
@@ -1052,6 +1077,50 @@ function SessionView(props: {
     setStatusMessage("הדוח נשמר מקומית במכשיר.");
   }
 
+  function updateJobMessage(update: ProcessingUpdate) {
+    const stage = update.stage || "processing";
+    const labels: Record<string, string> = {
+      queued: "הדוח עדיין ממתין לעיבוד.",
+      audio_received: "האודיו התקבל בשרת.",
+      saving_audio_to_cloud: "שומר עותק זמני מאובטח בענן.",
+      queued_for_background_processing: "הקובץ נשמר וממתין לעיבוד ברקע.",
+      downloading_audio_from_cloud: "טוען את ההקלטה מהאחסון המאובטח.",
+      transcribing_and_summarizing: "מתמלל ומפיק דוח. בפגישה ארוכה זה יכול לקחת כמה דקות.",
+      processing: "העיבוד עדיין מתבצע."
+    };
+    setDraft((current) => ({
+      ...current,
+      processingStatus: "processing",
+      processingStage: stage,
+      processingMessage: labels[stage] || "העיבוד עדיין מתבצע.",
+      updatedAt: new Date().toISOString()
+    }));
+    setStatusMessage(labels[stage] || "העיבוד עדיין מתבצע.");
+  }
+
+  async function checkProcessingJob() {
+    if (!draft.processingJobId) return;
+    setIsCheckingJob(true);
+    setStatusMessage("בודק אם הדוח מוכן...");
+    try {
+      const completed = await resumeProcessingJob(draft.processingJobId, updateJobMessage);
+      const nextSession: TherapySession = {
+        ...completed,
+        processingJobId: undefined,
+        processingStage: undefined,
+        processingMessage: undefined,
+        updatedAt: new Date().toISOString()
+      };
+      setDraft(nextSession);
+      props.onSave(nextSession);
+      setStatusMessage("הדוח מוכן ונשמר במכשיר.");
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "הדוח עדיין לא מוכן או שהבדיקה נכשלה.");
+    } finally {
+      setIsCheckingJob(false);
+    }
+  }
+
   const reportText = formatReport(draft);
 
   return (
@@ -1064,6 +1133,16 @@ function SessionView(props: {
         <h2>דו״ח סיכום פגישה טיפולית</h2>
         {draft.processingStatus === "failed" && (
           <p className="warning">{draft.report.administrativeNotes || "לא הצלחנו להפיק דו״ח. אפשר לנסות שוב."}</p>
+        )}
+        {draft.processingStatus === "processing" && draft.processingJobId && (
+          <div className="warning">
+            <strong>הדוח עדיין בעיבוד ברקע.</strong>
+            <p>{draft.processingMessage || "אפשר לחזור למסך הזה ולבדוק אם הדוח מוכן."}</p>
+            <button className="secondary-button" disabled={isCheckingJob} onClick={checkProcessingJob}>
+              <FileText />
+              {isCheckingJob ? "בודק..." : "בדוק אם הדוח מוכן"}
+            </button>
+          </div>
         )}
         {statusMessage && <p className="success-message">{statusMessage}</p>}
         <div className="meta-grid">

@@ -11,14 +11,20 @@ export type ProcessingUpdate = {
   stage?: string;
 };
 
+export type ProcessingOptions = {
+  onUpdate?: (update: ProcessingUpdate) => void;
+  onJobStarted?: (jobId: string) => void;
+};
+
 export async function processAudioDraft(
   session: TherapySession,
   audioFile?: File | Blob,
-  onUpdate?: (update: ProcessingUpdate) => void
+  options: ProcessingOptions | ((update: ProcessingUpdate) => void) = {}
 ): Promise<TherapySession> {
+  const { onUpdate, onJobStarted } = normalizeProcessingOptions(options);
   const file = audioFile ? normalizeAudioFile(session, audioFile) : null;
   if (file && file.size > CHUNKED_UPLOAD_THRESHOLD_BYTES) {
-    return processAudioDraftChunked(session, file, onUpdate);
+    return processAudioDraftChunked(session, file, { onUpdate, onJobStarted });
   }
 
   const formData = new FormData();
@@ -51,14 +57,16 @@ export async function processAudioDraft(
   if (payload.result) return payload.result;
   if (!payload.jobId) throw new Error("לא התקבל מזהה עיבוד מהשרת.");
 
+  onJobStarted?.(payload.jobId);
   return pollProcessingJob(payload.jobId, onUpdate);
 }
 
 async function processAudioDraftChunked(
   session: TherapySession,
   file: File,
-  onUpdate?: (update: ProcessingUpdate) => void
+  options: ProcessingOptions = {}
 ): Promise<TherapySession> {
+  const { onUpdate, onJobStarted } = options;
   try {
     onUpdate?.({ phase: "warming", stage: "warming_server" });
     await warmProcessingServer();
@@ -79,6 +87,7 @@ async function processAudioDraftChunked(
     }
 
     const jobId = String(startPayload.jobId);
+    onJobStarted?.(jobId);
     for (let offset = 0; offset < file.size; offset += AUDIO_UPLOAD_CHUNK_BYTES) {
       const chunk = file.slice(offset, Math.min(offset + AUDIO_UPLOAD_CHUNK_BYTES, file.size));
       await uploadAudioChunkWithRetry(jobId, chunk);
@@ -125,6 +134,13 @@ async function uploadAudioChunkWithRetry(jobId: string, chunk: Blob) {
   }
 
   throw lastError instanceof Error ? lastError : new Error("chunk_upload_failed");
+}
+
+export async function resumeProcessingJob(
+  jobId: string,
+  onUpdate?: (update: ProcessingUpdate) => void
+): Promise<TherapySession> {
+  return pollProcessingJob(jobId, onUpdate);
 }
 
 async function pollProcessingJob(jobId: string, onUpdate?: (update: ProcessingUpdate) => void): Promise<TherapySession> {
@@ -174,6 +190,11 @@ async function pollProcessingJob(jobId: string, onUpdate?: (update: ProcessingUp
   }
 
   throw new Error("העיבוד נמשך יותר מדי זמן. אם סימנת שמירת אודיו, הקובץ נשמר ב-Google Drive ואפשר לנסות שוב מאוחר יותר.");
+}
+
+function normalizeProcessingOptions(options: ProcessingOptions | ((update: ProcessingUpdate) => void)): ProcessingOptions {
+  if (typeof options === "function") return { onUpdate: options };
+  return options;
 }
 
 function delay(ms: number) {
