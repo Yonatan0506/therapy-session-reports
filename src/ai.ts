@@ -5,10 +5,20 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.
 const CHUNKED_UPLOAD_THRESHOLD_BYTES = 6 * 1024 * 1024;
 const AUDIO_UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 
-export async function processAudioDraft(session: TherapySession, audioFile?: File | Blob): Promise<TherapySession> {
+export type ProcessingUpdate = {
+  phase: "warming" | "uploading" | "processing";
+  percent?: number;
+  stage?: string;
+};
+
+export async function processAudioDraft(
+  session: TherapySession,
+  audioFile?: File | Blob,
+  onUpdate?: (update: ProcessingUpdate) => void
+): Promise<TherapySession> {
   const file = audioFile ? normalizeAudioFile(session, audioFile) : null;
   if (file && file.size > CHUNKED_UPLOAD_THRESHOLD_BYTES) {
-    return processAudioDraftChunked(session, file);
+    return processAudioDraftChunked(session, file, onUpdate);
   }
 
   const formData = new FormData();
@@ -19,7 +29,9 @@ export async function processAudioDraft(session: TherapySession, audioFile?: Fil
 
   let response: Response;
   try {
+    onUpdate?.({ phase: "warming", stage: "warming_server" });
     await warmProcessingServer();
+    onUpdate?.({ phase: "uploading", percent: 100, stage: "sending_audio" });
     response = await fetch(apiUrl("/api/process-session-job"), {
       method: "POST",
       body: formData
@@ -39,11 +51,16 @@ export async function processAudioDraft(session: TherapySession, audioFile?: Fil
   if (payload.result) return payload.result;
   if (!payload.jobId) throw new Error("לא התקבל מזהה עיבוד מהשרת.");
 
-  return pollProcessingJob(payload.jobId);
+  return pollProcessingJob(payload.jobId, onUpdate);
 }
 
-async function processAudioDraftChunked(session: TherapySession, file: File): Promise<TherapySession> {
+async function processAudioDraftChunked(
+  session: TherapySession,
+  file: File,
+  onUpdate?: (update: ProcessingUpdate) => void
+): Promise<TherapySession> {
   try {
+    onUpdate?.({ phase: "warming", stage: "warming_server" });
     await warmProcessingServer();
     const startResponse = await fetch(apiUrl("/api/process-session-upload"), {
       method: "POST",
@@ -65,6 +82,11 @@ async function processAudioDraftChunked(session: TherapySession, file: File): Pr
     for (let offset = 0; offset < file.size; offset += AUDIO_UPLOAD_CHUNK_BYTES) {
       const chunk = file.slice(offset, Math.min(offset + AUDIO_UPLOAD_CHUNK_BYTES, file.size));
       await uploadAudioChunkWithRetry(jobId, chunk);
+      onUpdate?.({
+        phase: "uploading",
+        percent: Math.min(100, Math.round((Math.min(offset + AUDIO_UPLOAD_CHUNK_BYTES, file.size) / file.size) * 100)),
+        stage: "uploading_audio"
+      });
     }
 
     const completeResponse = await fetch(apiUrl(`/api/process-session-upload/${encodeURIComponent(jobId)}/complete`), {
@@ -75,7 +97,7 @@ async function processAudioDraftChunked(session: TherapySession, file: File): Pr
       throw new Error(completePayload?.message || completePayload?.error || "upload_complete_failed");
     }
 
-    return pollProcessingJob(jobId);
+    return pollProcessingJob(jobId, onUpdate);
   } catch (error) {
     const detail = error instanceof Error && error.message ? ` פרטים: ${error.message}` : "";
     throw new Error(`לא הצלחנו להעלות את ההקלטה הארוכה לשרת העיבוד.${detail}`);
@@ -105,7 +127,7 @@ async function uploadAudioChunkWithRetry(jobId: string, chunk: Blob) {
   throw lastError instanceof Error ? lastError : new Error("chunk_upload_failed");
 }
 
-async function pollProcessingJob(jobId: string): Promise<TherapySession> {
+async function pollProcessingJob(jobId: string, onUpdate?: (update: ProcessingUpdate) => void): Promise<TherapySession> {
   const startedAt = Date.now();
   const timeoutMs = 90 * 60 * 1000;
   let transientFailures = 0;
@@ -120,6 +142,9 @@ async function pollProcessingJob(jobId: string): Promise<TherapySession> {
       response = await fetch(apiUrl(`/api/process-session-job/${encodeURIComponent(jobId)}`), { cache: "no-store" });
       payload = await response.json().catch(() => null);
       transientFailures = 0;
+      if (payload?.status && payload.status !== "completed") {
+        onUpdate?.({ phase: "processing", stage: payload.stage || payload.status });
+      }
     } catch (error) {
       transientFailures += 1;
       if (transientFailures > maxTransientFailures) {

@@ -27,7 +27,7 @@ import {
   UsersRound
 } from "lucide-react";
 import { v4 as uuid } from "uuid";
-import { askSessionQuestion, createProgressSummary, processAudioDraft } from "./ai";
+import { askSessionQuestion, createProgressSummary, processAudioDraft, type ProcessingUpdate } from "./ai";
 import {
   deletePatientFromDrive,
   deleteSessionFromDrive,
@@ -765,6 +765,29 @@ function NewSessionView(props: {
     setRecording(false);
   }
 
+  function updateProcessingMessage(update: ProcessingUpdate) {
+    if (update.phase === "warming") {
+      setRecordingMessage("מכין את שרת העיבוד...");
+      return;
+    }
+    if (update.phase === "uploading") {
+      setRecordingMessage(`מעלה את קובץ האודיו${typeof update.percent === "number" ? ` (${update.percent}%)` : ""}...`);
+      return;
+    }
+
+    const labels: Record<string, string> = {
+      queued: "הדוח ממתין לעיבוד.",
+      audio_received: "האודיו התקבל בשרת.",
+      saving_audio_to_cloud: "שומר עותק זמני מאובטח בענן לצורך עיבוד.",
+      queued_for_background_processing: "הקובץ נשמר וממתין לעיבוד ברקע.",
+      downloading_audio_from_cloud: "טוען את ההקלטה מהאחסון המאובטח.",
+      transcribing_and_summarizing: "מתמלל את ההקלטה ומפיק דוח. זה יכול לקחת כמה דקות בפגישה ארוכה.",
+      processing: "מעבד את ההקלטה.",
+      completed: "העיבוד הושלם."
+    };
+    setRecordingMessage(labels[update.stage || ""] || "מעבד את ההקלטה. אפשר להמתין עד שהדוח ייפתח.");
+  }
+
   async function process() {
     const displayName = patientName.trim();
     if (!displayName) return;
@@ -815,7 +838,11 @@ function NewSessionView(props: {
         }
       }
 
-      const completed = await processAudioDraft({ ...sessionForProcessing, processingStatus: "processing" }, audio);
+      const completed = await processAudioDraft(
+        { ...sessionForProcessing, processingStatus: "processing" },
+        audio,
+        updateProcessingMessage
+      );
       let finalSession = completed;
       if (storedAudioMeta) {
         finalSession = {

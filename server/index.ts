@@ -8,6 +8,15 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  buildObjectName,
+  deleteObject,
+  downloadJson,
+  downloadObject,
+  isCloudStorageConfigured,
+  uploadJson,
+  uploadObject
+} from "./cloudStorage";
 
 const app = express();
 const upload = multer({
@@ -24,9 +33,16 @@ type ProcessingJob = {
   updatedAt: string;
   result?: unknown;
   message?: string;
+  stage?: string;
+  session?: any;
+  audioObjectName?: string;
+  originalname?: string;
+  mimetype?: string;
+  size?: number;
 };
 
 const processingJobs = new Map<string, ProcessingJob>();
+const activeCloudJobs = new Set<string>();
 const uploadJobs = new Map<string, {
   session: any;
   filePath: string;
@@ -40,7 +56,12 @@ const uploadJobs = new Map<string, {
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, openai: Boolean(openai), ffmpeg: Boolean(ffmpegPath) });
+  res.json({
+    ok: true,
+    openai: Boolean(openai),
+    ffmpeg: Boolean(ffmpegPath),
+    cloudStorage: isCloudStorageConfigured()
+  });
 });
 
 app.get("/api/debug-openai", async (_req, res) => {
@@ -148,10 +169,15 @@ app.post("/api/process-session-job", upload.single("audio"), async (req, res) =>
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
   const file = cloneUploadedFile(req.file);
-  processingJobs.set(jobId, { status: "queued", createdAt: now, updatedAt: now });
+  const job: ProcessingJob = { status: "queued", createdAt: now, updatedAt: now, stage: "audio_received" };
+  processingJobs.set(jobId, job);
   res.status(202).json({ jobId, status: "queued" });
 
-  void runProcessingJob(jobId, session, file);
+  if (isCloudStorageConfigured()) {
+    void runCloudBackedJobFromFile(jobId, session, file);
+  } else {
+    void runProcessingJob(jobId, session, file);
+  }
 });
 
 app.post("/api/process-session-upload", async (req, res) => {
@@ -225,14 +251,22 @@ app.post("/api/process-session-upload/:jobId/complete", async (req, res) => {
   }
 
   res.status(202).json({ jobId: req.params.jobId, status: "queued" });
-  void runUploadedProcessingJob(req.params.jobId);
+  if (isCloudStorageConfigured()) {
+    void runCloudBackedUploadedProcessingJob(req.params.jobId);
+  } else {
+    void runUploadedProcessingJob(req.params.jobId);
+  }
 });
 
-app.get("/api/process-session-job/:jobId", (req, res) => {
-  const job = processingJobs.get(req.params.jobId);
+app.get("/api/process-session-job/:jobId", async (req, res) => {
+  const job = (await getProcessingJob(req.params.jobId)) || null;
   if (!job) {
     res.status(404).json({ error: "job_not_found", message: "עבודת העיבוד לא נמצאה. ייתכן שהשרת הופעל מחדש או שהעיבוד ישן מדי." });
     return;
+  }
+
+  if (isCloudStorageConfigured() && job.audioObjectName && (job.status === "queued" || job.status === "processing")) {
+    void runCloudProcessingJob(req.params.jobId);
   }
 
   if (job.status === "completed") {
@@ -245,7 +279,7 @@ app.get("/api/process-session-job/:jobId", (req, res) => {
     return;
   }
 
-  res.json({ status: job.status });
+  res.json({ status: job.status, stage: job.stage, message: job.message });
 });
 
 app.post("/api/chat-session", async (req, res) => {
@@ -461,6 +495,103 @@ async function processSessionAudio(session: any, file: Express.Multer.File) {
   };
 }
 
+async function runCloudBackedJobFromFile(jobId: string, session: any, file: Express.Multer.File) {
+  try {
+    updateProcessingJob(jobId, { status: "processing", stage: "saving_audio_to_cloud" });
+    const audioObjectName = buildAudioObjectName(jobId, session, file.originalname);
+    await uploadObject(audioObjectName, file.buffer, file.mimetype || "application/octet-stream");
+    const now = new Date().toISOString();
+    const current = processingJobs.get(jobId) || { status: "queued" as const, createdAt: now, updatedAt: now };
+    const job: ProcessingJob = {
+      ...current,
+      status: "queued" as const,
+      stage: "queued_for_background_processing",
+      session,
+      audioObjectName,
+      originalname: file.originalname,
+      mimetype: file.mimetype,
+      size: file.size
+    };
+    processingJobs.set(jobId, job);
+    await persistProcessingJob(jobId, job);
+    void runCloudProcessingJob(jobId);
+  } catch (error) {
+    const message = getSafeErrorMessage(error);
+    console.error("cloud_job_prepare_failed", jobId, message);
+    updateProcessingJob(jobId, { status: "failed", stage: "cloud_upload_failed", message });
+  }
+}
+
+async function runCloudBackedUploadedProcessingJob(jobId: string) {
+  const uploadJob = uploadJobs.get(jobId);
+  if (!uploadJob) {
+    updateProcessingJob(jobId, { status: "failed", stage: "upload_missing", message: "העלאת האודיו לא נמצאה." });
+    return;
+  }
+
+  try {
+    updateProcessingJob(jobId, { status: "processing", stage: "saving_audio_to_cloud" });
+    const buffer = await readFile(uploadJob.filePath);
+    const audioObjectName = buildAudioObjectName(jobId, uploadJob.session, uploadJob.originalname);
+    await uploadObject(audioObjectName, buffer, uploadJob.mimetype || "application/octet-stream");
+    const now = new Date().toISOString();
+    const current = processingJobs.get(jobId) || { status: "queued" as const, createdAt: now, updatedAt: now };
+    const job: ProcessingJob = {
+      ...current,
+      status: "queued" as const,
+      stage: "queued_for_background_processing",
+      session: uploadJob.session,
+      audioObjectName,
+      originalname: uploadJob.originalname,
+      mimetype: uploadJob.mimetype,
+      size: buffer.length
+    };
+    processingJobs.set(jobId, job);
+    await persistProcessingJob(jobId, job);
+    uploadJobs.delete(jobId);
+    await cleanupUploadJobDir(jobId);
+    void runCloudProcessingJob(jobId);
+  } catch (error) {
+    const message = getSafeErrorMessage(error);
+    console.error("cloud_uploaded_job_prepare_failed", jobId, message);
+    updateProcessingJob(jobId, { status: "failed", stage: "cloud_upload_failed", message });
+  }
+}
+
+async function runCloudProcessingJob(jobId: string) {
+  if (activeCloudJobs.has(jobId)) return;
+  activeCloudJobs.add(jobId);
+
+  try {
+    const job = await getProcessingJob(jobId);
+    if (!job?.audioObjectName || !job.session) {
+      updateProcessingJob(jobId, { status: "failed", stage: "missing_cloud_job_data", message: "חסרים פרטי עיבוד בענן." });
+      return;
+    }
+    if (job.status === "completed" || job.status === "failed") return;
+
+    updateProcessingJob(jobId, { status: "processing", stage: "downloading_audio_from_cloud" });
+    const buffer = await downloadObject(job.audioObjectName);
+    const file = buildCloudFile(job, buffer);
+    updateProcessingJob(jobId, { status: "processing", stage: "transcribing_and_summarizing" });
+    const result = await processSessionAudio(job.session, file);
+    updateProcessingJob(jobId, { status: "completed", stage: "completed", result });
+
+    if (process.env.DELETE_CLOUD_AUDIO_AFTER_SUCCESS !== "false") {
+      await deleteObject(job.audioObjectName).catch((error) => {
+        console.warn("cloud_audio_cleanup_failed", jobId, getSafeErrorMessage(error));
+      });
+    }
+  } catch (error) {
+    const message = getSafeErrorMessage(error);
+    console.error("cloud_processing_job_failed", jobId, message);
+    updateProcessingJob(jobId, { status: "failed", stage: "failed", message });
+  } finally {
+    activeCloudJobs.delete(jobId);
+    setTimeout(() => processingJobs.delete(jobId), PROCESSING_JOB_TTL_MS).unref?.();
+  }
+}
+
 async function runProcessingJob(jobId: string, session: any, file: Express.Multer.File) {
   updateProcessingJob(jobId, { status: "processing" });
   try {
@@ -502,11 +633,41 @@ async function runUploadedProcessingJob(jobId: string) {
 function updateProcessingJob(jobId: string, patch: Partial<ProcessingJob>) {
   const current = processingJobs.get(jobId);
   if (!current) return;
-  processingJobs.set(jobId, {
+  const next = {
     ...current,
     ...patch,
     updatedAt: new Date().toISOString()
-  });
+  };
+  processingJobs.set(jobId, next);
+  void persistProcessingJob(jobId, next);
+}
+
+async function getProcessingJob(jobId: string) {
+  const inMemory = processingJobs.get(jobId);
+  if (inMemory) return inMemory;
+  if (!isCloudStorageConfigured()) return null;
+  const persisted = await downloadJson<ProcessingJob>(jobObjectName(jobId));
+  if (persisted) processingJobs.set(jobId, persisted);
+  return persisted;
+}
+
+async function persistProcessingJob(jobId: string, job: ProcessingJob) {
+  if (!isCloudStorageConfigured()) return;
+  try {
+    await uploadJson(jobObjectName(jobId), job);
+  } catch (error) {
+    console.warn("persist_processing_job_failed", jobId, getSafeErrorMessage(error));
+  }
+}
+
+function jobObjectName(jobId: string) {
+  return buildObjectName("jobs", `${jobId}.json`);
+}
+
+function buildAudioObjectName(jobId: string, session: any, fileName: string) {
+  const date = String(session?.sessionDate || new Date().toISOString().slice(0, 10));
+  const patient = String(session?.patientDisplayName || "patient").slice(0, 60);
+  return buildObjectName("audio", date, `${patient}-${jobId}-${fileName || "recording"}`);
 }
 
 function cloneUploadedFile(file: Express.Multer.File): Express.Multer.File {
@@ -526,6 +687,21 @@ function buildUploadedFile(uploadJob: NonNullable<ReturnType<typeof uploadJobs.g
     destination: "",
     filename: uploadJob.originalname,
     path: uploadJob.filePath,
+    buffer,
+    stream: undefined as any
+  };
+}
+
+function buildCloudFile(job: ProcessingJob, buffer: Buffer): Express.Multer.File {
+  return {
+    fieldname: "audio",
+    originalname: job.originalname || "recording.webm",
+    encoding: "7bit",
+    mimetype: job.mimetype || "application/octet-stream",
+    size: buffer.length,
+    destination: "",
+    filename: job.originalname || "recording.webm",
+    path: "",
     buffer,
     stream: undefined as any
   };
