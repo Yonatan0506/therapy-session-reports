@@ -521,6 +521,9 @@ async function processSessionAudio(session: any, file: Express.Multer.File) {
   const now = new Date().toISOString();
   const fallback = buildDemoSession(session, now);
   const transcript = await transcribeAudio(file);
+  if (!hasMeaningfulTranscript(transcript)) {
+    throw new Error("התמלול מהאודיו יצא ריק. ייתכן שהקובץ הוקלט בעוצמה נמוכה, שהמיקרופון נחסם, או שמודל התמלול לא הצליח לפענח את ההקלטה. מומלץ לבדוק שהאודיו נשמע ברור ולנסות שוב.");
+  }
   let aiReport = normalizeAiReport(await createTherapyReport(session, transcript), transcript);
   if (!reportLooksHebrew(aiReport)) {
     aiReport = normalizeAiReport(await rewriteReportInHebrew(session, aiReport), transcript);
@@ -798,7 +801,7 @@ async function transcribeAudio(file: Express.Multer.File) {
 
   if (file.size <= DIRECT_TRANSCRIBE_LIMIT_BYTES && isDirectTranscriptionMime(file.mimetype)) {
     try {
-      const transcription = await transcribeBuffer(
+      const transcription = await transcribeBufferWithFallback(
         file.buffer,
         ensureAudioFileName(file.originalname, file.mimetype),
         file.mimetype,
@@ -818,16 +821,24 @@ async function transcribeAudio(file: Express.Multer.File) {
   try {
     for (const [index, chunk] of chunks.entries()) {
       const buffer = await readFile(chunk);
-      const transcription = await transcribeBuffer(buffer, path.basename(chunk), "audio/mpeg", `תמלול מקטע ${index + 1}`);
+      const transcription = await transcribeBufferWithFallback(buffer, path.basename(chunk), "audio/mpeg", `תמלול מקטע ${index + 1}`);
 
       const text = typeof transcription === "string" ? transcription : String(transcription);
-      transcripts.push(`[מקטע ${index + 1}]\n${text}`);
+      if (text.trim()) {
+        transcripts.push(`[מקטע ${index + 1}]\n${text.trim()}`);
+      } else {
+        console.warn("empty_transcription_chunk", index + 1, path.basename(chunk), buffer.length);
+      }
     }
   } finally {
     await cleanupChunks(chunks);
   }
 
-  return transcripts.join("\n\n");
+  const transcript = transcripts.join("\n\n");
+  if (!hasMeaningfulTranscript(transcript)) {
+    throw new Error("התמלול מהאודיו יצא ריק בכל המקטעים. ייתכן שההקלטה שקטה מדי או שהפורמט לא פוענח נכון.");
+  }
+  return transcript;
 }
 
 async function transcribeBuffer(buffer: Buffer, fileName: string, mimeType: string, label: string) {
@@ -838,9 +849,35 @@ async function transcribeBuffer(buffer: Buffer, fileName: string, mimeType: stri
       openai.audio.transcriptions.create({
         file: openAiFile,
         model: process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe",
-        response_format: "text"
+        response_format: "text",
+        language: "he",
+        prompt: "השיחה בעברית. תמלל את כל הדיבור הנשמע, גם אם האיכות נמוכה או הדיבור שקט."
       }),
     label
+  );
+}
+
+async function transcribeBufferWithFallback(buffer: Buffer, fileName: string, mimeType: string, label: string) {
+  const primary = await transcribeBuffer(buffer, fileName, mimeType, label);
+  const primaryText = typeof primary === "string" ? primary : String(primary);
+  if (primaryText.trim()) return primaryText;
+
+  const fallbackModel = process.env.OPENAI_FALLBACK_TRANSCRIBE_MODEL || "whisper-1";
+  if (fallbackModel === (process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe")) return primaryText;
+
+  console.warn("empty_transcription_trying_fallback", label, fallbackModel);
+  if (!openai) throw new Error("missing_openai_client");
+  const openAiFile = await toFile(buffer, fileName, { type: mimeType });
+  return withOpenAiRetry(
+    () =>
+      openai.audio.transcriptions.create({
+        file: openAiFile,
+        model: fallbackModel,
+        response_format: "text",
+        language: "he",
+        prompt: "השיחה בעברית. תמלל את כל הדיבור הנשמע, גם אם האיכות נמוכה או הדיבור שקט."
+      }),
+    `${label} - גיבוי`
   );
 }
 
@@ -868,6 +905,8 @@ async function createAudioChunks(file: Express.Multer.File) {
     "1",
     "-ar",
     "16000",
+    "-af",
+    "dynaudnorm=f=150:g=15,volume=1.8",
     "-b:a",
     "48k",
     "-f",
@@ -947,6 +986,16 @@ function isUnsupportedAudioError(message: string) {
 function isDirectAudioTooLargeError(message: string) {
   const lower = message.toLowerCase();
   return lower.includes("tokens") && lower.includes("audio") && lower.includes("too large");
+}
+
+function hasMeaningfulTranscript(transcript: string) {
+  const withoutSegmentLabels = transcript
+    .replace(/\[מקטע \d+\]/g, "")
+    .replace(/\[׳׳§׳˜׳¢ \d+\]/g, "")
+    .trim();
+  const hebrewLetters = withoutSegmentLabels.match(/[\u0590-\u05ff]/g)?.length || 0;
+  const latinLetters = withoutSegmentLabels.match(/[a-zA-Z]/g)?.length || 0;
+  return withoutSegmentLabels.length > 80 && hebrewLetters + latinLetters > 30;
 }
 
 async function createTherapyReport(session: any, transcript: string) {

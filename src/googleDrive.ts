@@ -253,12 +253,12 @@ async function waitForGoogleIdentity() {
   throw new Error("Google Identity Services לא נטען בדפדפן");
 }
 
-function requestAccessToken(clientId: string) {
+function requestAccessToken(clientId: string, prompt: "consent" | "" = "consent") {
   return new Promise<string>((resolve, reject) => {
     const tokenClient = window.google!.accounts.oauth2.initTokenClient({
       client_id: clientId,
       scope: GOOGLE_SCOPES,
-      prompt: "consent",
+      prompt,
       callback: (response) => {
         if (response.error || !response.access_token) {
           reject(new Error(response.error || "לא התקבל access token מגוגל"));
@@ -268,8 +268,26 @@ function requestAccessToken(clientId: string) {
       }
     });
 
-    tokenClient.requestAccessToken({ prompt: "consent" });
+    tokenClient.requestAccessToken({ prompt });
   });
+}
+
+async function refreshGoogleAccessToken() {
+  if (isNativeGoogleAuthAvailable()) {
+    const result = await window.Capacitor!.Plugins!.NativeGoogleAuth!.signIn({
+      scopes: GOOGLE_SCOPES.split(" ")
+    });
+    if (!result.accessToken) throw new Error("לא התקבל access token מעודכן מ-Google");
+    sessionStorage.setItem("therapy:google-access-token", result.accessToken);
+    return result.accessToken;
+  }
+
+  const clientId = await getGoogleClientId();
+  if (!clientId) throw new Error("חסר Google Client ID לחידוש החיבור ל-Drive");
+  await waitForGoogleIdentity();
+  const token = await requestAccessToken(clientId, "");
+  sessionStorage.setItem("therapy:google-access-token", token);
+  return token;
 }
 
 async function signInWithNativeGoogle(): Promise<{ user: UserProfile; accessToken: string }> {
@@ -425,9 +443,11 @@ async function downloadJsonFile<T>(accessToken: string, folderId: string, fileNa
   const fileId = await findFile(accessToken, folderId, fileName);
   if (!fileId) return null;
 
-  const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
+  let response = await fetchDrive(accessToken, `/drive/v3/files/${fileId}?alt=media`);
+  if (response.status === 401) {
+    const refreshedToken = await refreshGoogleAccessToken();
+    response = await fetchDrive(refreshedToken, `/drive/v3/files/${fileId}?alt=media`);
+  }
 
   if (!response.ok) {
     const text = await response.text();
@@ -478,14 +498,27 @@ async function renameDriveFile(accessToken: string, fileId: string, name: string
 }
 
 async function driveFetch(accessToken: string, path: string, init: RequestInit = {}) {
-  const response = await fetch(`https://www.googleapis.com${path}`, {
+  const response = await fetchDrive(accessToken, path, init);
+  if (response.status === 401) {
+    const refreshedToken = await refreshGoogleAccessToken();
+    const retryResponse = await fetchDrive(refreshedToken, path, init);
+    return parseDriveResponse(retryResponse);
+  }
+
+  return parseDriveResponse(response);
+}
+
+function fetchDrive(accessToken: string, path: string, init: RequestInit = {}) {
+  return fetch(`https://www.googleapis.com${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${accessToken}`,
       ...(init.headers || {})
     }
   });
+}
 
+async function parseDriveResponse(response: Response) {
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`שגיאת Google Drive: ${response.status} ${text.slice(0, 240)}`);
