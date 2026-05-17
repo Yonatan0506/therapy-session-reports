@@ -1,6 +1,6 @@
 import type { TherapySession } from "./types";
 
-const DEFAULT_REMOTE_API_BASE = "https://therapy-session-reports.onrender.com";
+const DEFAULT_REMOTE_API_BASE = "https://therapy-session-reports-82786531752.me-west1.run.app";
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
 const CHUNKED_UPLOAD_THRESHOLD_BYTES = 6 * 1024 * 1024;
 const AUDIO_UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
