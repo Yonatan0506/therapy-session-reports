@@ -17,6 +17,7 @@ import {
   Mic,
   Pause,
   Play,
+  RefreshCw,
   Save,
   Search,
   Send,
@@ -27,7 +28,15 @@ import {
   UsersRound
 } from "lucide-react";
 import { v4 as uuid } from "uuid";
-import { askSessionQuestion, createProgressSummary, processAudioDraft, resumeProcessingJob, type ProcessingUpdate } from "./ai";
+import {
+  askSessionQuestion,
+  createProgressSummary,
+  getProcessingHealth,
+  processAudioDraft,
+  resumeProcessingJob,
+  type ProcessingHealth,
+  type ProcessingUpdate
+} from "./ai";
 import {
   deletePatientFromDrive,
   deleteSessionFromDrive,
@@ -70,7 +79,7 @@ declare global {
   }
 }
 
-type View = "login" | "home" | "patients" | "patient" | "new-recording" | "new-upload" | "session";
+type View = "login" | "home" | "patients" | "patient" | "new-recording" | "new-upload" | "session" | "processing";
 
 const emptyReport: SessionReport = {
   title: "דו״ח סיכום פגישה טיפולית",
@@ -158,9 +167,14 @@ export function App() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [nameQuery, setNameQuery] = useState("");
   const [dateQuery, setDateQuery] = useState("");
+  const [processingHealth, setProcessingHealth] = useState<ProcessingHealth | null>(null);
+  const [isCheckingHealth, setIsCheckingHealth] = useState(false);
 
   const selectedPatient = patients.find((patient) => patient.patientId === selectedPatientId) || null;
   const selectedSession = sessions.find((session) => session.sessionId === selectedSessionId) || null;
+  const backgroundSessions = sessions.filter(
+    (session) => session.processingStatus === "processing" || session.processingStatus === "pending" || session.processingStatus === "failed"
+  );
 
   function syncToDrive(nextPatients: Patient[], nextSessions: TherapySession[]) {
     if (!googleAccessToken) return;
@@ -200,6 +214,74 @@ export function App() {
     setSessions(next);
     storage.saveSessions(next);
     syncToDrive(patients, next);
+  }
+
+  function updateSessionLocally(session: TherapySession) {
+    setSessions((current) => {
+      const next = current.map((item) => (item.sessionId === session.sessionId ? session : item));
+      storage.saveSessions(next);
+      syncToDrive(patients, next);
+      return next;
+    });
+  }
+
+  async function refreshProcessingSession(sessionId: string) {
+    const session = sessions.find((item) => item.sessionId === sessionId);
+    if (!session?.processingJobId) {
+      setAppMessage("אין לעיבוד הזה מזהה עבודה פעיל. אפשר לפתוח את הדוח ולנסות להפיק אותו מחדש אם יש אודיו שמור.");
+      return;
+    }
+
+    setAppMessage(`בודק אם הדוח של ${session.patientDisplayName} מוכן...`);
+    try {
+      const completed = await resumeProcessingJob(session.processingJobId, (update) => {
+        const stage = update.stage || "processing";
+        updateSessionLocally({
+          ...session,
+          processingStatus: "processing",
+          processingStage: stage,
+          processingMessage: processingStageMessage(stage),
+          updatedAt: new Date().toISOString()
+        });
+      });
+      updateSessionLocally({
+        ...completed,
+        processingJobId: undefined,
+        processingStage: undefined,
+        processingMessage: undefined,
+        updatedAt: new Date().toISOString()
+      });
+      setAppMessage(`הדוח של ${completed.patientDisplayName} מוכן ונשמר.`);
+    } catch (error) {
+      setAppMessage(error instanceof Error ? error.message : "בדיקת העיבוד נכשלה.");
+    }
+  }
+
+  async function refreshAllProcessingSessions() {
+    const active = sessions.filter((session) => session.processingStatus === "processing" && session.processingJobId);
+    if (active.length === 0) {
+      setAppMessage("אין כרגע עיבודים פעילים לבדיקה.");
+      return;
+    }
+
+    for (const session of active) {
+      await refreshProcessingSession(session.sessionId);
+    }
+  }
+
+  async function checkProcessingHealth() {
+    setIsCheckingHealth(true);
+    try {
+      const health = await getProcessingHealth();
+      setProcessingHealth(health);
+      setAppMessage(health.ok && health.openai && health.ffmpeg && health.cloudStorage
+        ? "מערכת העיבוד זמינה."
+        : "מערכת העיבוד מגיבה, אבל חסרה הגדרה אחת או יותר.");
+    } catch (error) {
+      setAppMessage(error instanceof Error ? `בדיקת מצב המערכת נכשלה: ${error.message}` : "בדיקת מצב המערכת נכשלה.");
+    } finally {
+      setIsCheckingHealth(false);
+    }
   }
 
   async function signIn() {
@@ -395,7 +477,28 @@ export function App() {
               <UsersRound />
               מטופלים
             </button>
+            <button className="secondary-button" onClick={() => setView("processing")}>
+              <RefreshCw />
+              עיבודים ברקע{backgroundSessions.length ? ` (${backgroundSessions.length})` : ""}
+            </button>
           </div>
+
+          {backgroundSessions.length > 0 && (
+            <ProcessingQueueSummary
+              sessions={backgroundSessions}
+              onOpen={(sessionId) => {
+                setSelectedSessionId(sessionId);
+                setView("session");
+              }}
+              onRefresh={(sessionId) => refreshProcessingSession(sessionId)}
+            />
+          )}
+
+          <SystemStatusPanel
+            health={processingHealth}
+            isChecking={isCheckingHealth}
+            onCheck={checkProcessingHealth}
+          />
 
           <section className="toolbar">
             <label>
@@ -417,6 +520,19 @@ export function App() {
             }}
           />
         </section>
+      )}
+
+      {view === "processing" && (
+        <ProcessingQueueView
+          sessions={backgroundSessions}
+          onBack={() => setView("home")}
+          onOpen={(sessionId) => {
+            setSelectedSessionId(sessionId);
+            setView("session");
+          }}
+          onRefresh={(sessionId) => refreshProcessingSession(sessionId)}
+          onRefreshAll={refreshAllProcessingSessions}
+        />
       )}
 
       {view === "patients" && (
@@ -500,6 +616,124 @@ function mergeSessions(primary: TherapySession[], secondary: TherapySession[]) {
   return Array.from(map.values()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+function ProcessingQueueSummary(props: {
+  sessions: TherapySession[];
+  onOpen: (sessionId: string) => void;
+  onRefresh: (sessionId: string) => void;
+}) {
+  const activeCount = props.sessions.filter((session) => session.processingStatus === "processing").length;
+  const failedCount = props.sessions.filter((session) => session.processingStatus === "failed").length;
+
+  return (
+    <section className="queue-banner">
+      <div>
+        <strong>עיבודים ברקע</strong>
+        <span>
+          {activeCount > 0 ? `${activeCount} דוחות עדיין בעיבוד` : "אין עיבוד פעיל כרגע"}
+          {failedCount > 0 ? ` · ${failedCount} דוחות נכשלו ודורשים בדיקה` : ""}
+        </span>
+      </div>
+      <div className="queue-actions">
+        {props.sessions.slice(0, 2).map((session) => (
+          <button className="secondary-button" key={session.sessionId} onClick={() => props.onRefresh(session.sessionId)}>
+            <RefreshCw />
+            בדוק {session.patientDisplayName}
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ProcessingQueueView(props: {
+  sessions: TherapySession[];
+  onBack: () => void;
+  onOpen: (sessionId: string) => void;
+  onRefresh: (sessionId: string) => void;
+  onRefreshAll: () => void;
+}) {
+  const active = props.sessions.filter((session) => session.processingStatus === "processing" || session.processingStatus === "pending");
+  const failed = props.sessions.filter((session) => session.processingStatus === "failed");
+
+  return (
+    <section className="page-grid">
+      <div className="section-title">
+        <h1>עיבודים ברקע</h1>
+        <button className="secondary-button" onClick={props.onBack}>חזרה</button>
+      </div>
+      <section className="queue-panel">
+        <div className="queue-header">
+          <div>
+            <strong>{active.length} פעילים</strong>
+            <span>{failed.length} נכשלו</span>
+          </div>
+          <button className="primary-button" onClick={props.onRefreshAll} disabled={active.length === 0}>
+            <RefreshCw />
+            בדוק את כל הפעילים
+          </button>
+        </div>
+        {props.sessions.length === 0 && <div className="empty-state">אין כרגע דוחות שממתינים לעיבוד או בדיקה.</div>}
+        {props.sessions.map((session) => (
+          <div className="queue-row" key={session.sessionId}>
+            <div>
+              <strong>{session.patientDisplayName}</strong>
+              <small>{session.sessionDate} · {session.sessionStartTime}</small>
+              <span>{session.processingMessage || processingStageMessage(session.processingStage || session.processingStatus)}</span>
+            </div>
+            <span className={`status status-${session.processingStatus}`}>{statusLabel(session.processingStatus)}</span>
+            <div className="queue-actions">
+              {session.processingJobId && (
+                <button className="secondary-button" onClick={() => props.onRefresh(session.sessionId)}>
+                  <RefreshCw />
+                  בדוק אם מוכן
+                </button>
+              )}
+              <button className="secondary-button" onClick={() => props.onOpen(session.sessionId)}>
+                <FileText />
+                פתח דוח
+              </button>
+            </div>
+          </div>
+        ))}
+      </section>
+    </section>
+  );
+}
+
+function SystemStatusPanel(props: {
+  health: ProcessingHealth | null;
+  isChecking: boolean;
+  onCheck: () => void;
+}) {
+  const isHealthy = Boolean(props.health?.ok && props.health.openai && props.health.ffmpeg && props.health.cloudStorage);
+
+  return (
+    <section className="system-status">
+      <div>
+        <strong>מצב מערכת</strong>
+        <span>
+          {props.health
+            ? isHealthy
+              ? `תקין · מצב עיבוד ${props.health.processingMode}`
+              : "יש רכיב שדורש בדיקה"
+            : "אפשר לבדוק שהשרת, OpenAI ואחסון הענן זמינים"}
+        </span>
+      </div>
+      {props.health && (
+        <div className="health-pills">
+          <span className={props.health.openai ? "pill-ok" : "pill-bad"}>OpenAI</span>
+          <span className={props.health.ffmpeg ? "pill-ok" : "pill-bad"}>FFmpeg</span>
+          <span className={props.health.cloudStorage ? "pill-ok" : "pill-bad"}>Cloud Storage</span>
+        </div>
+      )}
+      <button className="secondary-button" disabled={props.isChecking} onClick={props.onCheck}>
+        <RefreshCw />
+        {props.isChecking ? "בודק..." : "בדוק מצב"}
+      </button>
+    </section>
+  );
+}
+
 function SessionList(props: { title: string; sessions: TherapySession[]; onOpen: (sessionId: string) => void }) {
   return (
     <section>
@@ -520,6 +754,22 @@ function SessionList(props: { title: string; sessions: TherapySession[]; onOpen:
       </div>
     </section>
   );
+}
+
+function processingStageMessage(stage: string) {
+  const labels: Record<string, string> = {
+    queued: "הדוח ממתין לעיבוד.",
+    pending: "הדוח ממתין לעיבוד.",
+    audio_received: "האודיו התקבל בשרת.",
+    saving_audio_to_cloud: "שומר עותק זמני מאובטח בענן לצורך עיבוד.",
+    queued_for_background_processing: "הקובץ נשמר וממתין לעיבוד ברקע.",
+    downloading_audio_from_cloud: "טוען את ההקלטה מהאחסון המאובטח.",
+    transcribing_and_summarizing: "מתמלל ומפיק דוח. בפגישה ארוכה זה יכול לקחת כמה דקות.",
+    processing: "העיבוד עדיין מתבצע.",
+    completed: "העיבוד הושלם.",
+    failed: "העיבוד נכשל ודורש ניסיון חוזר או בדיקה."
+  };
+  return labels[stage] || "העיבוד עדיין מתבצע.";
 }
 
 function statusLabel(status: TherapySession["processingStatus"]) {
@@ -1079,23 +1329,15 @@ function SessionView(props: {
 
   function updateJobMessage(update: ProcessingUpdate) {
     const stage = update.stage || "processing";
-    const labels: Record<string, string> = {
-      queued: "הדוח עדיין ממתין לעיבוד.",
-      audio_received: "האודיו התקבל בשרת.",
-      saving_audio_to_cloud: "שומר עותק זמני מאובטח בענן.",
-      queued_for_background_processing: "הקובץ נשמר וממתין לעיבוד ברקע.",
-      downloading_audio_from_cloud: "טוען את ההקלטה מהאחסון המאובטח.",
-      transcribing_and_summarizing: "מתמלל ומפיק דוח. בפגישה ארוכה זה יכול לקחת כמה דקות.",
-      processing: "העיבוד עדיין מתבצע."
-    };
+    const message = processingStageMessage(stage);
     setDraft((current) => ({
       ...current,
       processingStatus: "processing",
       processingStage: stage,
-      processingMessage: labels[stage] || "העיבוד עדיין מתבצע.",
+      processingMessage: message,
       updatedAt: new Date().toISOString()
     }));
-    setStatusMessage(labels[stage] || "העיבוד עדיין מתבצע.");
+    setStatusMessage(message);
   }
 
   async function checkProcessingJob() {

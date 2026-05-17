@@ -16,6 +16,20 @@ export type ProcessingOptions = {
   onJobStarted?: (jobId: string) => void;
 };
 
+export type ProcessingHealth = {
+  ok: boolean;
+  openai: boolean;
+  ffmpeg: boolean;
+  cloudStorage: boolean;
+  processingMode: string;
+};
+
+export async function getProcessingHealth(): Promise<ProcessingHealth> {
+  const response = await fetch(apiUrl("/api/health"), { cache: "no-store" });
+  if (!response.ok) throw new Error(`health ${response.status}`);
+  return response.json() as Promise<ProcessingHealth>;
+}
+
 export async function processAudioDraft(
   session: TherapySession,
   audioFile?: File | Blob,
