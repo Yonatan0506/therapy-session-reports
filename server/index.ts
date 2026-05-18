@@ -528,6 +528,12 @@ async function processSessionAudio(session: any, file: Express.Multer.File) {
   if (!reportLooksHebrew(aiReport)) {
     aiReport = normalizeAiReport(await rewriteReportInHebrew(session, aiReport), transcript);
   }
+  if (!reportLooksDetailed(aiReport)) {
+    aiReport = normalizeAiReport(await enrichTherapyReport(session, transcript, aiReport), transcript);
+    if (!reportLooksHebrew(aiReport)) {
+      aiReport = normalizeAiReport(await rewriteReportInHebrew(session, aiReport), transcript);
+    }
+  }
 
   return {
     ...session,
@@ -1011,7 +1017,20 @@ async function createTherapyReport(session: any, transcript: string) {
           {
             role: "system",
             content:
-              "אתה מסייע למטפל לנסח דו״ח סיכום פגישה טיפולית בעברית בלבד. כל ערכי הטקסט בדוח חייבים להיות בעברית, גם אם התמלול, שמות המשתתפים או חלק מהשיחה באנגלית. החזר JSON תקין בלבד, ללא Markdown וללא טקסט מסביב. חובה להשתמש בשמות השדות באנגלית בדיוק כפי שמופיעים בסכמה. כתוב בגוף שלישי, בניסוח מקצועי, זהיר ולא אבחוני מדי. הפרד בין מידע שנאמר בפגישה לבין פרשנות טיפולית. אל תמציא פרטים."
+              [
+                "אתה מסייע למטפל לנסח דו״ח סיכום פגישה טיפולית בעברית בלבד.",
+                "החזר JSON תקין בלבד, ללא Markdown וללא טקסט מסביב. שמות השדות חייבים להישאר באנגלית בדיוק כפי שמופיעים בסכמה.",
+                "המטרה היא דוח מקצועי-טיפולי עשיר, ספציפי וקליני, בסגנון תיעוד של מטפל מנוסה, לא סיכום כללי ודל.",
+                "כתוב בגוף שלישי, בעברית טבעית, רגישה וזהירה. הימנע מאבחנות נחרצות אם הן לא נאמרו במפורש.",
+                "שמות ודמויות: אם בתמלול מוזכרים שמות פרטיים, ראשי תיבות או כינויים, השתמש בהם בדוח כפי שנאמרו. אל תחליף אותם במילים כלליות כמו 'הילדים', 'הבעל' או 'בן משפחה' כאשר יש שם או ראשי תיבות. אם ברור שמדובר בבעל/ילד/אב/אם, אפשר לכתוב למשל 'בעלה ע׳' או 'בנה ה׳'. אל תמציא שמות שלא נאמרו.",
+                "בחלק sessionNarrative כתוב את מהלך המפגש: מה המטופל/ת שיתף/ה, אילו אירועים, רגשות, דפוסים, יחסים, קונפליקטים, פחדים וזיכרונות עלו. השתמש בפרטים ממשיים מתוך התמלול, כולל שמות, תפקידים, קשרים משפחתיים, אירועים ותאריכים אם נאמרו. אל תכניס כאן פרשנות קלינית עמוקה או התערבויות של המטפל.",
+                "בחלק therapeuticInsights כתוב את ההמשגה הטיפולית ואת ההתערבויות: מה המטפל שיקף, בדק, המשיג, אתגר, הציע או הדגיש; אילו קשרים טיפוליים ניתן לשער בין עבר להווה; אילו דפוסים רגשיים/זוגיים/משפחתיים עלו. נסח בזהירות: 'נראה כי', 'ייתכן', 'ניתן לשער', 'עלה קישור בין'.",
+                "הדוח צריך להיות מפורט: sessionNarrative לפחות 2-4 פסקאות עשירות כאשר יש מספיק חומר; therapeuticInsights לפחות 1-3 פסקאות. אל תסתפק בניסוחים כלליים כמו 'קשיים משפחתיים ומקצועיים' אם בתמלול יש פרטים.",
+                "followUpPoints צריכים להיות 4-7 נקודות מעקב ממוקדות, טיפוליות וקונקרטיות.",
+                "administrativeNotes יכלול רק עניינים מנהליים שנאמרו: תשלום, התחייבות, ביטוח, תיאום פגישה, מספר מפגשים, מסמכים וכדומה. אם לא נאמר, השאר ריק או קצר.",
+                "crmSummary יהיה 3-4 שורות בלבד, יבש ומקצועי, ללא פירוט מזהה עודף.",
+                "אל תמציא פרטים. אם דבר לא ברור, כתוב בזהירות שהוא עלה באופן לא ודאי או השמט אותו."
+              ].join(" ")
           },
           {
             role: "user",
@@ -1026,7 +1045,14 @@ async function createTherapyReport(session: any, transcript: string) {
 תמלול זמני:
 ${transcript}
 
-החזר JSON במבנה הזה בדיוק. שמות השדות חייבים להישאר באנגלית:
+החזר JSON במבנה הזה בדיוק. שמות השדות חייבים להישאר באנגלית.
+הנחיות איכות מחייבות:
+- meetingTopic: משפט קצר, ספציפי וטיפולי, לא כותרת כללית.
+- sessionNarrative: תיאור עשיר של מה שנאמר בפגישה, כולל שמות/ראשי תיבות שהוזכרו, אירועים, רגשות, עומסים, יחסים ודוגמאות.
+- therapeuticInsights: המשגה והתערבויות טיפוליות, כולל שיקופים, שאלות, דימויים, אתגורים והבחנות של המטפל אם הופיעו בתמלול.
+- followUpPoints: נקודות מעקב טיפוליות קונקרטיות.
+- administrativeNotes: רק נושאים מנהליים שנאמרו.
+- internalSessionMemory: שמור מידע מפורט יותר לשאלות המשך, תוך הפרדה בין עובדות לפרשנות.
 {
   "meetingTopic": "",
   "sessionNarrative": "",
@@ -1064,7 +1090,7 @@ async function rewriteReportInHebrew(session: any, report: any) {
           {
             role: "system",
             content:
-              "תקן דוח פגישה טיפולית כך שכל ערכי הטקסט יהיו בעברית בלבד. שמות השדות חייבים להישאר באנגלית בדיוק. אל תוסיף פרטים חדשים ואל תשנה עובדות. אם יש שמות פרטיים, השאר אותם כפי שנמסרו או תעתק לעברית אם טבעי. החזר JSON תקין בלבד."
+              "תקן דוח פגישה טיפולית כך שכל ערכי הטקסט יהיו בעברית בלבד, מקצועיים וטיפוליים יותר. שמות השדות חייבים להישאר באנגלית בדיוק. אל תמציא פרטים ואל תשנה עובדות. אם יש שמות פרטיים, ראשי תיבות או כינויים, השאר אותם בדוח כפי שנמסרו ואל תחליף אותם בתיאורים כלליים. שמור על הפרדה בין מה שנאמר בפגישה לבין פרשנות והתערבויות טיפוליות. החזר JSON תקין בלבד."
           },
           {
             role: "user",
@@ -1089,6 +1115,54 @@ async function rewriteReportInHebrew(session: any, report: any) {
   return JSON.parse(completion.choices[0]?.message?.content || "{}");
 }
 
+async function enrichTherapyReport(session: any, transcript: string, report: any) {
+  if (!openai) throw new Error("missing_openai_client");
+
+  const completion = await withOpenAiRetry(
+    () =>
+      openai.chat.completions.create({
+        model: process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini",
+        temperature: 0.15,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "שפר דוח סיכום פגישה טיפולית בעברית כך שיהיה מקצועי, טיפולי, עשיר וספציפי יותר, בדומה לתיעוד קליני של מטפל מנוסה. החזר JSON תקין בלבד עם אותם שמות שדות באנגלית. אל תמציא פרטים. השתמש רק בתמלול ובדוח הקיים. שמור שמות פרטיים, ראשי תיבות וכינויים כפי שנאמרו. הרחב את מהלך המפגש בפרטים ממשיים ואת התובנות בהתערבויות/המשגות טיפוליות. אל תכתוב סיכום כללי ודל."
+          },
+          {
+            role: "user",
+            content: JSON.stringify(
+              {
+                metadata: {
+                  sessionDate: session.sessionDate,
+                  patientDisplayName: session.patientDisplayName,
+                  therapistName: session.therapistName,
+                  participants: session.participants || ""
+                },
+                currentReport: report,
+                transcript,
+                requiredStyle: {
+                  meetingTopic: "משפט קצר וספציפי שמתאר את הקונפליקט/מוקד העבודה",
+                  sessionNarrative: "2-4 פסקאות עשירות של מה שנאמר בפגישה, עם שמות, אירועים, רגשות ודפוסים",
+                  therapeuticInsights: "1-3 פסקאות של המשגה והתערבויות טיפוליות: שיקופים, שאלות, דימויים, אתגורים והקשרים בין עבר להווה",
+                  followUpPoints: "4-7 נקודות מעקב טיפוליות וקונקרטיות",
+                  administrativeNotes: "רק מה שנאמר בנושאים מנהליים",
+                  crmSummary: "3-4 שורות קצרות ויבשות"
+                }
+              },
+              null,
+              2
+            )
+          }
+        ]
+      }),
+    "העמקת איכות הדוח"
+  );
+
+  return JSON.parse(completion.choices[0]?.message?.content || "{}");
+}
+
 function reportLooksHebrew(report: any) {
   const text = [
     report?.meetingTopic,
@@ -1102,6 +1176,21 @@ function reportLooksHebrew(report: any) {
   const hebrewLetters = (text.match(/[\u0590-\u05FF]/g) || []).length;
   const latinLetters = (text.match(/[A-Za-z]/g) || []).length;
   return hebrewLetters >= 40 && hebrewLetters >= latinLetters;
+}
+
+function reportLooksDetailed(report: any) {
+  const narrative = String(report?.sessionNarrative || "");
+  const insights = String(report?.therapeuticInsights || "");
+  const followUpCount = Array.isArray(report?.followUpPoints) ? report.followUpPoints.length : 0;
+  const genericSignals = [
+    "קשיים משפחתיים",
+    "לחצים משפחתיים ומקצועיים",
+    "רצון לשפר את ההבנה העצמית",
+    "תמיכה בהתמודדות",
+    "תהליך טיפולי ממוקד יותר"
+  ].filter((signal) => `${narrative} ${insights}`.includes(signal)).length;
+
+  return narrative.length >= 650 && insights.length >= 450 && followUpCount >= 4 && genericSignals < 2;
 }
 
 async function withOpenAiRetry<T>(operation: () => Promise<T>, label: string): Promise<T> {
