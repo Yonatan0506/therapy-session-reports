@@ -9,6 +9,7 @@ import {
 } from "docx";
 import {
   CalendarDays,
+  CheckCircle2,
   ClipboardCopy,
   FileAudio,
   FileText,
@@ -1281,10 +1282,17 @@ function SessionView(props: {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
+  const [actionFeedback, setActionFeedback] = useState<"save" | "share" | "crm" | "word" | "">("");
   const [isCheckingJob, setIsCheckingJob] = useState(false);
 
   function updateReport(key: keyof SessionReport, value: string | string[]) {
     setDraft({ ...draft, report: { ...draft.report, [key]: value }, updatedAt: new Date().toISOString() });
+  }
+
+  function showActionFeedback(action: "save" | "share" | "crm" | "word", message: string) {
+    setActionFeedback(action);
+    setStatusMessage(message);
+    window.setTimeout(() => setActionFeedback((current) => (current === action ? "" : current)), 3500);
   }
 
   async function ask(allPatientSessions: boolean) {
@@ -1302,10 +1310,10 @@ function SessionView(props: {
       const isLikelyMobile = window.matchMedia("(pointer: coarse)").matches;
       if (navigator.share && isLikelyMobile) {
         await navigator.share({ text });
-        setStatusMessage("תפריט השיתוף נפתח.");
+        showActionFeedback("share", "תפריט השיתוף נפתח. אם בחרת אפליקציה ושלחת, הפעולה בוצעה.");
       } else {
         await navigator.clipboard.writeText(text);
-        setStatusMessage("הדוח הועתק ללוח. במחשב זה אמין יותר מתפריט השיתוף של הדפדפן.");
+        showActionFeedback("share", "הדוח הועתק ללוח. אפשר להדביק אותו בכל מקום.");
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
@@ -1313,18 +1321,20 @@ function SessionView(props: {
         return;
       }
       await navigator.clipboard.writeText(text);
-      setStatusMessage("השיתוף לא נפתח, אז הדוח הועתק ללוח.");
+      showActionFeedback("share", "השיתוף לא נפתח, אז הדוח הועתק ללוח.");
     }
   }
 
   async function copyCrmSummary() {
     await navigator.clipboard.writeText(draft.report.crmSummary || "");
-    setStatusMessage("סיכום ה-CRM הועתק ללוח.");
+    showActionFeedback("crm", "סיכום ה-CRM הועתק ללוח.");
   }
 
   function saveDraft() {
-    props.onSave(draft);
-    setStatusMessage("הדוח נשמר מקומית במכשיר.");
+    const nextDraft = { ...draft, updatedAt: new Date().toISOString() };
+    setDraft(nextDraft);
+    props.onSave(nextDraft);
+    showActionFeedback("save", "הדוח נשמר במכשיר. אם Google Drive מחובר, הוא יסונכרן גם ל-Drive.");
   }
 
   function updateJobMessage(update: ProcessingUpdate) {
@@ -1401,19 +1411,31 @@ function SessionView(props: {
         <label>סיכום קצר ל CRM<textarea value={draft.report.crmSummary} onChange={(event) => updateReport("crmSummary", event.target.value)} /></label>
       </section>
       <div className="action-strip">
-        <button className="primary-button" onClick={saveDraft}><Save /> שמור</button>
-        <button className="secondary-button" onClick={() => shareText(reportText)}><Share2 /> שתף טקסט</button>
-        <button className="secondary-button" onClick={copyCrmSummary}><ClipboardCopy /> העתק סיכום CRM</button>
-        <button className="secondary-button" onClick={async () => {
+        <button className={actionFeedback === "save" ? "primary-button action-done" : "primary-button"} onClick={saveDraft}>
+          {actionFeedback === "save" ? <CheckCircle2 /> : <Save />}
+          {actionFeedback === "save" ? "נשמר" : "שמור"}
+        </button>
+        <button className={actionFeedback === "share" ? "secondary-button action-done" : "secondary-button"} onClick={() => shareText(reportText)}>
+          {actionFeedback === "share" ? <CheckCircle2 /> : <Share2 />}
+          {actionFeedback === "share" ? "בוצע" : "שתף טקסט"}
+        </button>
+        <button className={actionFeedback === "crm" ? "secondary-button action-done" : "secondary-button"} onClick={copyCrmSummary}>
+          {actionFeedback === "crm" ? <CheckCircle2 /> : <ClipboardCopy />}
+          {actionFeedback === "crm" ? "הועתק" : "העתק סיכום CRM"}
+        </button>
+        <button className={actionFeedback === "word" ? "secondary-button action-done" : "secondary-button"} onClick={async () => {
           const blob = await createDocxBlob(draft);
           downloadBlob(blob, `session_${draft.sessionId}.docx`);
           if (getStoredAccessToken()) {
             await uploadSessionDocxToDrive(getStoredAccessToken(), draft, blob);
-            setStatusMessage("קובץ Word נוצר, ירד למחשב ונשמר ב-Google Drive.");
+            showActionFeedback("word", "קובץ Word נוצר, ירד למחשב ונשמר ב-Google Drive.");
           } else {
-            setStatusMessage("קובץ Word נוצר ונשלח להורדה.");
+            showActionFeedback("word", "קובץ Word נוצר ונשלח להורדה.");
           }
-        }}><FileText /> ייצא Word</button>
+        }}>
+          {actionFeedback === "word" ? <CheckCircle2 /> : <FileText />}
+          {actionFeedback === "word" ? "נוצר" : "ייצא Word"}
+        </button>
         <button className="danger-button" onClick={props.onDelete}><Trash2 /> מחק פגישה</button>
       </div>
       <section className="chat-panel">

@@ -153,6 +153,12 @@ svg {
   font-weight: 650;
 }
 
+.action-done {
+  color: #166534;
+  border-color: #86efac;
+  background: #dcfce7;
+}
+
 .danger-button {
   color: #b42318;
   border: 1px solid #fecaca;
