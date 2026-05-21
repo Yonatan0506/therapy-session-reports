@@ -16,6 +16,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -213,6 +214,7 @@ svg {
 }
 
 input,
+select,
 textarea {
   width: 100%;
   border: 1px solid #cfd8e6;

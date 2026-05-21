@@ -934,7 +934,7 @@ function NewSessionView(props: {
   const [date, setDate] = useState(today());
   const [time, setTime] = useState(timeNow());
   const [participants, setParticipants] = useState("");
-  const [sessionType, setSessionType] = useState("");
+  const [sessionType, setSessionType] = useState("טיפול");
   const [file, setFile] = useState<File | null>(null);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -1156,7 +1156,13 @@ function NewSessionView(props: {
         <label>תאריך פגישה<input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label>
         <label>שעת התחלה<input type="time" value={time} onChange={(event) => setTime(event.target.value)} /></label>
         <label>שם מטפל<input value={props.userName} readOnly /></label>
-        <label>סוג פגישה<input value={sessionType} onChange={(event) => setSessionType(event.target.value)} /></label>
+        <label>
+          סוג פגישה
+          <select value={sessionType} onChange={(event) => setSessionType(event.target.value)}>
+            <option value="טיפול">טיפול</option>
+            <option value="אינטייק">אינטייק</option>
+          </select>
+        </label>
         <label>נוכחים בפגישה<input value={participants} onChange={(event) => setParticipants(event.target.value)} /></label>
       </section>
       {props.mode === "recording" ? (
@@ -1374,6 +1380,7 @@ function SessionView(props: {
   }
 
   const reportText = formatReport(draft);
+  const reportLabels = getReportLabels(draft);
 
   return (
     <section className="page-grid">
@@ -1382,7 +1389,7 @@ function SessionView(props: {
         <button className="secondary-button" onClick={props.onBack}>חזרה</button>
       </div>
       <section className="report-editor">
-        <h2>דו״ח סיכום פגישה טיפולית</h2>
+        <h2>{reportLabels.title}</h2>
         {draft.processingStatus === "failed" && (
           <p className="warning">{draft.report.administrativeNotes || "לא הצלחנו להפיק דו״ח. אפשר לנסות שוב."}</p>
         )}
@@ -1403,10 +1410,10 @@ function SessionView(props: {
           <span>שם המטפל/ת: {draft.therapistName}</span>
           <span>אודיו מקור: {draft.audioStored ? "נשמר ב-Google Drive" : "לא נשמר"}</span>
         </div>
-        <label>נושא המפגש<textarea value={draft.report.meetingTopic} onChange={(event) => updateReport("meetingTopic", event.target.value)} /></label>
-        <label>מהלך המפגש<textarea value={draft.report.sessionNarrative} onChange={(event) => updateReport("sessionNarrative", event.target.value)} /></label>
-        <label>תובנות מהתערבויות טיפוליות<textarea value={draft.report.therapeuticInsights} onChange={(event) => updateReport("therapeuticInsights", event.target.value)} /></label>
-        <label>נקודות חשובות למעקב<textarea value={draft.report.followUpPoints.join("\n")} onChange={(event) => updateReport("followUpPoints", event.target.value.split("\n").filter(Boolean))} /></label>
+        <label>{reportLabels.topic}<textarea value={draft.report.meetingTopic} onChange={(event) => updateReport("meetingTopic", event.target.value)} /></label>
+        <label>{reportLabels.narrative}<textarea value={draft.report.sessionNarrative} onChange={(event) => updateReport("sessionNarrative", event.target.value)} /></label>
+        <label>{reportLabels.insights}<textarea value={draft.report.therapeuticInsights} onChange={(event) => updateReport("therapeuticInsights", event.target.value)} /></label>
+        <label>{reportLabels.followUp}<textarea value={draft.report.followUpPoints.join("\n")} onChange={(event) => updateReport("followUpPoints", event.target.value.split("\n").filter(Boolean))} /></label>
         <label>הערות אדמיניסטרטיביות<textarea value={draft.report.administrativeNotes} onChange={(event) => updateReport("administrativeNotes", event.target.value)} /></label>
         <label>סיכום קצר ל CRM<textarea value={draft.report.crmSummary} onChange={(event) => updateReport("crmSummary", event.target.value)} /></label>
       </section>
@@ -1452,23 +1459,25 @@ function SessionView(props: {
 }
 
 function formatReport(session: TherapySession) {
+  const labels = getReportLabels(session);
   return [
-    "דו״ח סיכום פגישה טיפולית",
+    labels.title,
     "",
     `תאריך המפגש: ${session.sessionDate}`,
     `שם המטופל/ת: ${session.patientDisplayName}`,
     `שם המטפל/ת: ${session.therapistName}`,
+    `סוג פגישה: ${session.sessionType || "טיפול"}`,
     "",
-    "נושא המפגש",
+    labels.topic,
     session.report.meetingTopic,
     "",
-    "מהלך המפגש",
+    labels.narrative,
     session.report.sessionNarrative,
     "",
-    "תובנות מהתערבויות טיפוליות",
+    labels.insights,
     session.report.therapeuticInsights,
     "",
-    "נקודות חשובות למעקב",
+    labels.followUp,
     session.report.followUpPoints.map((point) => `• ${point}`).join("\n"),
     "",
     "הערות אדמיניסטרטיביות",
@@ -1479,7 +1488,33 @@ function formatReport(session: TherapySession) {
   ].join("\n");
 }
 
+function isIntakeSession(session: Pick<TherapySession, "sessionType">) {
+  const value = String(session.sessionType || "").toLowerCase();
+  return value.includes("אינטייק") || value.includes("intake");
+}
+
+function getReportLabels(session: Pick<TherapySession, "sessionType">) {
+  if (isIntakeSession(session)) {
+    return {
+      title: "דו״ח אינטייק טיפולי",
+      topic: "פרטים כלליים",
+      narrative: "סיבת פנייה",
+      insights: "רקע ותמונה קלינית ראשונית",
+      followUp: "מוקדים להמשך בירור וטיפול"
+    };
+  }
+
+  return {
+    title: "דו״ח סיכום פגישה טיפולית",
+    topic: "נושא המפגש",
+    narrative: "מהלך המפגש",
+    insights: "תובנות מהתערבויות טיפוליות",
+    followUp: "נקודות חשובות למעקב"
+  };
+}
+
 async function createDocxBlob(session: TherapySession) {
+  const labels = getReportLabels(session);
   const paragraph = (text: string, bold = false) =>
     new Paragraph({
       bidirectional: true,
@@ -1494,7 +1529,7 @@ async function createDocxBlob(session: TherapySession) {
         properties: {},
         children: [
           new Paragraph({
-            text: "דו״ח סיכום פגישה טיפולית",
+            text: labels.title,
             heading: HeadingLevel.TITLE,
             bidirectional: true,
             alignment: AlignmentType.RIGHT
@@ -1502,13 +1537,14 @@ async function createDocxBlob(session: TherapySession) {
           paragraph(`תאריך המפגש: ${session.sessionDate}`),
           paragraph(`שם המטופל/ת: ${session.patientDisplayName}`),
           paragraph(`שם המטפל/ת: ${session.therapistName}`),
-          paragraph("נושא המפגש", true),
+          paragraph(`סוג פגישה: ${session.sessionType || "טיפול"}`),
+          paragraph(labels.topic, true),
           paragraph(session.report.meetingTopic),
-          paragraph("מהלך המפגש", true),
+          paragraph(labels.narrative, true),
           paragraph(session.report.sessionNarrative),
-          paragraph("תובנות מהתערבויות טיפוליות", true),
+          paragraph(labels.insights, true),
           paragraph(session.report.therapeuticInsights),
-          paragraph("נקודות חשובות למעקב", true),
+          paragraph(labels.followUp, true),
           ...session.report.followUpPoints.map((point) => paragraph(point)),
           paragraph("הערות אדמיניסטרטיביות", true),
           paragraph(session.report.administrativeNotes),
