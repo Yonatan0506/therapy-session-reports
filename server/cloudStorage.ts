@@ -78,6 +78,82 @@ export async function deleteObject(objectName: string) {
   }
 }
 
+export async function listObjects(prefix: string) {
+  const bucket = requireBucket();
+  const accessToken = await getAccessToken();
+  const items: { name: string; size: number }[] = [];
+  let pageToken = "";
+
+  do {
+    const url = new URL(`https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o`);
+    url.searchParams.set("prefix", prefix);
+    url.searchParams.set("maxResults", "1000");
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
+
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!response.ok) {
+      throw new Error(`Cloud Storage list failed ${response.status}: ${await response.text()}`);
+    }
+
+    const payload = (await response.json()) as { items?: { name: string; size?: string }[]; nextPageToken?: string };
+    for (const item of payload.items || []) {
+      items.push({ name: item.name, size: Number(item.size || 0) });
+    }
+    pageToken = payload.nextPageToken || "";
+  } while (pageToken);
+
+  return items;
+}
+
+// Cloud Storage מאפשר לחבר עד 32 אובייקטים בקריאה אחת, ולכן חיבור של הרבה מקטעים
+// נעשה בסבבים דרך אובייקטי ביניים שנמחקים בסוף.
+const COMPOSE_MAX_SOURCES = 32;
+
+export async function composeObjects(destinationName: string, sourceNames: string[], contentType = "application/octet-stream") {
+  if (!sourceNames.length) throw new Error("compose requires at least one source object");
+
+  if (sourceNames.length <= COMPOSE_MAX_SOURCES) {
+    await composeOnce(destinationName, sourceNames, contentType);
+    return;
+  }
+
+  const intermediates: string[] = [];
+  try {
+    for (let index = 0; index < sourceNames.length; index += COMPOSE_MAX_SOURCES) {
+      const group = sourceNames.slice(index, index + COMPOSE_MAX_SOURCES);
+      const name = `${destinationName}.compose-${String(intermediates.length).padStart(4, "0")}`;
+      await composeOnce(name, group, contentType);
+      intermediates.push(name);
+    }
+    await composeObjects(destinationName, intermediates, contentType);
+  } finally {
+    for (const name of intermediates) {
+      await deleteObject(name).catch(() => undefined);
+    }
+  }
+}
+
+async function composeOnce(destinationName: string, sourceNames: string[], contentType: string) {
+  const bucket = requireBucket();
+  const accessToken = await getAccessToken();
+  const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(destinationName)}/compose`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      sourceObjects: sourceNames.map((name) => ({ name })),
+      destination: { contentType }
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Cloud Storage compose failed ${response.status}: ${await response.text()}`);
+  }
+}
+
 export async function uploadJson(objectName: string, value: unknown) {
   await uploadObject(objectName, Buffer.from(JSON.stringify(value, null, 2), "utf8"), "application/json; charset=utf-8");
 }

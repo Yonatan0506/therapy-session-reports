@@ -102,9 +102,11 @@ async function processAudioDraftChunked(
 
     const jobId = String(startPayload.jobId);
     onJobStarted?.(jobId);
+    let chunkIndex = 0;
     for (let offset = 0; offset < file.size; offset += AUDIO_UPLOAD_CHUNK_BYTES) {
       const chunk = file.slice(offset, Math.min(offset + AUDIO_UPLOAD_CHUNK_BYTES, file.size));
-      await uploadAudioChunkWithRetry(jobId, chunk);
+      await uploadAudioChunkWithRetry(jobId, chunk, chunkIndex);
+      chunkIndex += 1;
       onUpdate?.({
         phase: "uploading",
         percent: Math.min(100, Math.round((Math.min(offset + AUDIO_UPLOAD_CHUNK_BYTES, file.size) / file.size) * 100)),
@@ -113,7 +115,9 @@ async function processAudioDraftChunked(
     }
 
     const completeResponse = await fetch(apiUrl(`/api/process-session-upload/${encodeURIComponent(jobId)}/complete`), {
-      method: "POST"
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ totalChunks: chunkIndex })
     });
     const completePayload = await completeResponse.json().catch(() => null);
     if (!completeResponse.ok) {
@@ -127,15 +131,20 @@ async function processAudioDraftChunked(
   }
 }
 
-async function uploadAudioChunkWithRetry(jobId: string, chunk: Blob) {
+async function uploadAudioChunkWithRetry(jobId: string, chunk: Blob, index: number) {
   let lastError: unknown;
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     try {
-      const response = await fetch(apiUrl(`/api/process-session-upload/${encodeURIComponent(jobId)}/chunk`), {
-        method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: chunk
-      });
+      // מספר המקטע מאפשר לשרת לשמור כל מקטע בנפרד בענן, כך שאין תלות בכך שכל
+      // המקטעים יגיעו לאותו instance, וניסיון חוזר על אותו מקטע פשוט דורס אותו.
+      const response = await fetch(
+        apiUrl(`/api/process-session-upload/${encodeURIComponent(jobId)}/chunk?index=${index}`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream", "x-chunk-index": String(index) },
+          body: chunk
+        }
+      );
       if (!response.ok) {
         const payload = await response.json().catch(() => null);
         throw new Error(payload?.message || payload?.error || `chunk_upload_failed_${response.status}`);

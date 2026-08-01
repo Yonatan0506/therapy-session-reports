@@ -10,10 +10,12 @@ import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/pro
 import path from "node:path";
 import {
   buildObjectName,
+  composeObjects,
   deleteObject,
   downloadJson,
   downloadObject,
   isCloudStorageConfigured,
+  listObjects,
   uploadJson,
   uploadObject
 } from "./cloudStorage";
@@ -66,6 +68,15 @@ type ProcessingJob = {
   originalname?: string;
   mimetype?: string;
   size?: number;
+};
+
+// פרטי העלאה מקוטעת שנשמרים בענן, כדי שכל instance של Cloud Run יוכל לטפל בכל מקטע.
+type CloudUploadMeta = {
+  session: any;
+  originalname: string;
+  mimetype: string;
+  size: number;
+  createdAt: string;
 };
 
 const processingJobs = new Map<string, ProcessingJob>();
@@ -238,6 +249,27 @@ app.post("/api/process-session-upload", async (req, res) => {
 
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
+
+  // כשיש Cloud Storage, פרטי ההעלאה והמקטעים נשמרים בענן ולא על הדיסק המקומי,
+  // כי ב-Cloud Run אין הבטחה שכל מקטע יגיע לאותו instance.
+  if (isCloudStorageConfigured()) {
+    const meta: CloudUploadMeta = { session, originalname, mimetype, size, createdAt: now };
+    try {
+      await uploadJson(uploadMetaObjectName(jobId), meta);
+    } catch (error) {
+      const message = getSafeErrorMessage(error);
+      console.error("cloud_upload_start_failed", jobId, message);
+      res.status(500).json({ error: "upload_start_failed", message: `לא הצלחנו לפתוח העלאה בענן. ${message}` });
+      return;
+    }
+
+    const job: ProcessingJob = { status: "queued", createdAt: now, updatedAt: now, stage: "uploading_audio", session };
+    processingJobs.set(jobId, job);
+    await persistProcessingJob(jobId, job);
+    res.status(202).json({ jobId, status: "uploading", storage: "cloud" });
+    return;
+  }
+
   const uploadDir = await ensureUploadJobDir(jobId);
   const filePath = path.join(uploadDir, "audio-upload");
   await writeFile(filePath, Buffer.alloc(0));
@@ -252,22 +284,47 @@ app.post("/api/process-session-upload", async (req, res) => {
     createdAt: now
   });
 
-  res.status(202).json({ jobId, status: "uploading" });
+  res.status(202).json({ jobId, status: "uploading", storage: "local" });
 });
 
 app.post(
   "/api/process-session-upload/:jobId/chunk",
   express.raw({ type: "*/*", limit: "6mb" }),
   async (req, res) => {
-    const uploadJob = uploadJobs.get(req.params.jobId);
-    if (!uploadJob) {
-      res.status(404).json({ error: "upload_not_found", message: "העלאת האודיו לא נמצאה. נסה להתחיל מחדש." });
-      return;
-    }
-
+    const jobId = req.params.jobId;
     const chunk = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || []);
     if (!chunk.length) {
       res.status(400).json({ error: "empty_chunk", message: "התקבל מקטע אודיו ריק." });
+      return;
+    }
+
+    const chunkIndex = parseChunkIndex(req);
+
+    // לקוח מעודכן שולח מספר מקטע, ואז אפשר לשמור כל מקטע כאובייקט נפרד בענן.
+    // לקוח ישן בלי מספר מקטע ממשיך בנתיב הישן של קובץ מקומי.
+    if (isCloudStorageConfigured() && chunkIndex !== null) {
+      const meta = await downloadJson<CloudUploadMeta>(uploadMetaObjectName(jobId)).catch(() => null);
+      if (!meta) {
+        res.status(404).json({ error: "upload_not_found", message: "העלאת האודיו לא נמצאה. נסה להתחיל מחדש." });
+        return;
+      }
+
+      try {
+        await uploadObject(uploadPartObjectName(jobId, chunkIndex), chunk, "application/octet-stream");
+      } catch (error) {
+        const message = getSafeErrorMessage(error);
+        console.error("cloud_chunk_upload_failed", jobId, chunkIndex, message);
+        res.status(500).json({ error: "chunk_upload_failed", message: `שמירת מקטע האודיו בענן נכשלה. ${message}` });
+        return;
+      }
+
+      res.json({ ok: true, index: chunkIndex, receivedBytes: chunk.length, expectedBytes: meta.size });
+      return;
+    }
+
+    const uploadJob = uploadJobs.get(jobId);
+    if (!uploadJob) {
+      res.status(404).json({ error: "upload_not_found", message: "העלאת האודיו לא נמצאה. נסה להתחיל מחדש." });
       return;
     }
 
@@ -278,7 +335,24 @@ app.post(
 );
 
 app.post("/api/process-session-upload/:jobId/complete", async (req, res) => {
-  const uploadJob = uploadJobs.get(req.params.jobId);
+  const jobId = req.params.jobId;
+  const uploadJob = uploadJobs.get(jobId);
+
+  if (!uploadJob && isCloudStorageConfigured()) {
+    const meta = await downloadJson<CloudUploadMeta>(uploadMetaObjectName(jobId)).catch(() => null);
+    if (!meta) {
+      res.status(404).json({ error: "upload_not_found", message: "העלאת האודיו לא נמצאה. נסה להתחיל מחדש." });
+      return;
+    }
+
+    // טוען את העבודה מהענן לזיכרון של ה-instance הנוכחי כדי שעדכוני הסטטוס יתפסו.
+    await getProcessingJob(jobId);
+    const expectedChunks = Number(req.body?.totalChunks || 0);
+    res.status(202).json({ jobId, status: "queued" });
+    void runCloudUploadedJobFromParts(jobId, meta, expectedChunks);
+    return;
+  }
+
   if (!uploadJob) {
     res.status(404).json({ error: "upload_not_found", message: "העלאת האודיו לא נמצאה. נסה להתחיל מחדש." });
     return;
@@ -677,6 +751,87 @@ async function runCloudBackedUploadedProcessingJob(jobId: string) {
     console.error("cloud_uploaded_job_prepare_failed", jobId, message);
     updateProcessingJob(jobId, { status: "failed", stage: "cloud_upload_failed", message });
   }
+}
+
+async function runCloudUploadedJobFromParts(jobId: string, meta: CloudUploadMeta, expectedChunks: number) {
+  try {
+    updateProcessingJob(jobId, { status: "processing", stage: "merging_audio_chunks" });
+
+    const parts = (await listObjects(uploadPartsPrefix(jobId))).sort((a, b) => a.name.localeCompare(b.name));
+    if (!parts.length) {
+      throw new Error("לא נמצאו מקטעי אודיו שהועלו לענן. יש לנסות להעלות את ההקלטה שוב.");
+    }
+
+    if (expectedChunks && parts.length !== expectedChunks) {
+      throw new Error(`ההעלאה לא הושלמה: הגיעו ${parts.length} מקטעים מתוך ${expectedChunks}. יש לנסות להעלות את ההקלטה שוב.`);
+    }
+
+    const receivedBytes = parts.reduce((total, part) => total + part.size, 0);
+    if (meta.size && receivedBytes !== meta.size) {
+      throw new Error(`ההעלאה לא הושלמה: התקבלו ${receivedBytes} מתוך ${meta.size} בתים. יש לנסות להעלות את ההקלטה שוב.`);
+    }
+
+    const audioObjectName = buildAudioObjectName(jobId, meta.session, meta.originalname);
+    await composeObjects(
+      audioObjectName,
+      parts.map((part) => part.name),
+      meta.mimetype || "application/octet-stream"
+    );
+
+    const now = new Date().toISOString();
+    const current = processingJobs.get(jobId) || { status: "queued" as const, createdAt: now, updatedAt: now };
+    const job: ProcessingJob = {
+      ...current,
+      status: "queued" as const,
+      stage: "queued_for_background_processing",
+      session: meta.session,
+      audioObjectName,
+      originalname: meta.originalname,
+      mimetype: meta.mimetype,
+      size: receivedBytes
+    };
+    processingJobs.set(jobId, job);
+    await persistProcessingJob(jobId, job);
+    await cleanupCloudUploadParts(jobId, parts.map((part) => part.name));
+
+    if (shouldRunCloudJobInline()) {
+      void runCloudProcessingJob(jobId);
+    }
+  } catch (error) {
+    const message = getSafeErrorMessage(error);
+    console.error("cloud_parts_merge_failed", jobId, message);
+    updateProcessingJob(jobId, { status: "failed", stage: "merge_failed", message });
+  }
+}
+
+async function cleanupCloudUploadParts(jobId: string, partNames: string[]) {
+  for (const name of partNames) {
+    await deleteObject(name).catch((error) => {
+      console.warn("cloud_part_cleanup_failed", jobId, name, getSafeErrorMessage(error));
+    });
+  }
+  await deleteObject(uploadMetaObjectName(jobId)).catch((error) => {
+    console.warn("cloud_upload_meta_cleanup_failed", jobId, getSafeErrorMessage(error));
+  });
+}
+
+function parseChunkIndex(req: express.Request) {
+  const raw = req.query?.index ?? req.header("x-chunk-index");
+  if (raw === undefined || raw === null || raw === "") return null;
+  const index = Number(raw);
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
+function uploadMetaObjectName(jobId: string) {
+  return buildObjectName("uploads", jobId, "meta.json");
+}
+
+function uploadPartsPrefix(jobId: string) {
+  return `${buildObjectName("uploads", jobId, "parts")}/`;
+}
+
+function uploadPartObjectName(jobId: string, index: number) {
+  return buildObjectName("uploads", jobId, "parts", `${String(index).padStart(5, "0")}.part`);
 }
 
 async function runCloudProcessingJob(jobId: string) {
