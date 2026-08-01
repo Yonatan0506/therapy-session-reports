@@ -33,6 +33,27 @@ const DEFAULT_TRANSCRIBE_MODEL = "gpt-transcribe";
 const DEFAULT_SUMMARY_MODEL = "gpt-5.6-sol";
 const DEFAULT_CHAT_MODEL = "gpt-5.6-sol";
 
+function getChatModel() {
+  return process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL;
+}
+
+function getSummaryModel() {
+  return process.env.OPENAI_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL;
+}
+
+function getTranscribeModel() {
+  return process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL;
+}
+
+// מודלי gpt-5 ו-o* מקבלים רק את ברירת המחדל של temperature ומחזירים 400 על כל ערך אחר.
+function supportsCustomTemperature(model: string) {
+  return !/^(gpt-5|o[1-9])/i.test(model.trim());
+}
+
+function temperatureOption(model: string, temperature: number) {
+  return supportsCustomTemperature(model) ? { temperature } : {};
+}
+
 type ProcessingJob = {
   status: "queued" | "processing" | "completed" | "failed";
   createdAt: string;
@@ -68,9 +89,9 @@ app.get("/api/health", (_req, res) => {
     ffmpeg: Boolean(ffmpegPath),
     cloudStorage: isCloudStorageConfigured(),
     processingMode: PROCESSING_MODE,
-    chatModel: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
-    summaryModel: process.env.OPENAI_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL,
-    transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL,
+    chatModel: getChatModel(),
+    summaryModel: getSummaryModel(),
+    transcribeModel: getTranscribeModel(),
     audioChunkSeconds: getAudioChunkSeconds(),
     directTranscribeLimitBytes: DIRECT_TRANSCRIBE_LIMIT_BYTES
   });
@@ -88,10 +109,12 @@ app.get("/api/debug-openai", async (_req, res) => {
     return;
   }
 
+  const chatModel = getChatModel();
+
   try {
     const completion = await openai.chat.completions.create({
-      model: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
-      temperature: 0,
+      model: chatModel,
+      ...temperatureOption(chatModel, 0),
       messages: [
         { role: "system", content: "ענה במילה אחת בעברית." },
         { role: "user", content: "בדיקה" }
@@ -100,16 +123,17 @@ app.get("/api/debug-openai", async (_req, res) => {
 
     res.json({
       ok: true,
-      chatModel: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
-      transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL,
+      chatModel,
+      summaryModel: getSummaryModel(),
+      transcribeModel: getTranscribeModel(),
       sample: completion.choices[0]?.message?.content || ""
     });
   } catch (error) {
     res.status(500).json({
       ok: false,
       step: "chat",
-      chatModel: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
-      message: getSafeErrorMessage(error)
+      chatModel,
+      message: getSafeErrorMessage(enrichOpenAiError(error, "בדיקת מודל הצ׳אט"))
     });
   }
 });
@@ -360,37 +384,43 @@ app.post("/api/chat-session", async (req, res) => {
     return;
   }
 
+  const chatModel = getChatModel();
+
   try {
-    const completion = await openai.chat.completions.create({
-      model: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content:
-            "אתה מסייע למטפל לענות בעברית על שאלות לגבי פגישה טיפולית שכבר סוכמה. אל תמציא מידע. אם אין מספיק מידע, ענה בדיוק: אין מספיק מידע בדוח הפגישה כדי לקבוע זאת. הבחֵן בין מה שנאמר בפגישה לבין פרשנות טיפולית, והימנע מאבחנות נחרצות."
-        },
-        {
-          role: "user",
-          content: JSON.stringify(
+    const completion = await withOpenAiRetry(
+      () =>
+        openai.chat.completions.create({
+          model: chatModel,
+          ...temperatureOption(chatModel, 0.2),
+          messages: [
             {
-              question,
-              sessionReport: session.report,
-              internalSessionMemory: session.internalSessionMemory,
-              metadata: {
-                patientDisplayName: session.patientDisplayName,
-                therapistName: session.therapistName,
-                sessionDate: session.sessionDate,
-                participants: session.participants
-              },
-              previousSessions: req.body?.previousSessions || []
+              role: "system",
+              content:
+                "אתה מסייע למטפל לענות בעברית על שאלות לגבי פגישה טיפולית שכבר סוכמה. אל תמציא מידע. אם אין מספיק מידע, ענה בדיוק: אין מספיק מידע בדוח הפגישה כדי לקבוע זאת. הבחֵן בין מה שנאמר בפגישה לבין פרשנות טיפולית, והימנע מאבחנות נחרצות."
             },
-            null,
-            2
-          )
-        }
-      ]
-    });
+            {
+              role: "user",
+              content: JSON.stringify(
+                {
+                  question,
+                  sessionReport: session.report,
+                  internalSessionMemory: session.internalSessionMemory,
+                  metadata: {
+                    patientDisplayName: session.patientDisplayName,
+                    therapistName: session.therapistName,
+                    sessionDate: session.sessionDate,
+                    participants: session.participants
+                  },
+                  previousSessions: req.body?.previousSessions || []
+                },
+                null,
+                2
+              )
+            }
+          ]
+        }),
+      "מענה על שאלה לגבי הפגישה"
+    );
 
     res.json({ answer: completion.choices[0]?.message?.content || "אין מספיק מידע בדוח הפגישה כדי לקבוע זאת." });
   } catch (error) {
@@ -416,8 +446,8 @@ app.post("/api/progress-summary", async (req, res) => {
     const completion = await withOpenAiRetry(
       () =>
         openai.chat.completions.create({
-          model: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
-          temperature: 0.2,
+          model: getChatModel(),
+          ...temperatureOption(getChatModel(), 0.2),
           messages: [
             {
               role: "system",
@@ -860,7 +890,7 @@ async function transcribeAudio(file: Express.Multer.File) {
 async function transcribeBuffer(buffer: Buffer, fileName: string, mimeType: string, label: string) {
   if (!openai) throw new Error("missing_openai_client");
   const openAiFile = await toFile(buffer, fileName, { type: mimeType });
-  const model = process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL;
+  const model = getTranscribeModel();
   return withOpenAiRetry(
     () =>
       openai.audio.transcriptions.create({
@@ -880,7 +910,7 @@ async function transcribeBufferWithFallback(buffer: Buffer, fileName: string, mi
   if (primaryText.trim()) return primaryText;
 
   const fallbackModel = process.env.OPENAI_FALLBACK_TRANSCRIBE_MODEL || "whisper-1";
-  if (fallbackModel === (process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL)) return primaryText;
+  if (fallbackModel === getTranscribeModel()) return primaryText;
 
   console.warn("empty_transcription_trying_fallback", label, fallbackModel);
   if (!openai) throw new Error("missing_openai_client");
@@ -1045,8 +1075,8 @@ async function createTherapyReport(session: any, transcript: string) {
   const completion = await withOpenAiRetry(
     () =>
       openai.chat.completions.create({
-        model: process.env.OPENAI_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL,
-        temperature: 0.2,
+        model: getSummaryModel(),
+        ...temperatureOption(getSummaryModel(), 0.2),
         response_format: { type: "json_object" },
         messages: [
           {
@@ -1123,8 +1153,8 @@ async function rewriteReportInHebrew(session: any, report: any) {
   const completion = await withOpenAiRetry(
     () =>
       openai.chat.completions.create({
-        model: process.env.OPENAI_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL,
-        temperature: 0,
+        model: getSummaryModel(),
+        ...temperatureOption(getSummaryModel(), 0),
         response_format: { type: "json_object" },
         messages: [
           {
@@ -1162,8 +1192,8 @@ async function enrichTherapyReport(session: any, transcript: string, report: any
   const completion = await withOpenAiRetry(
     () =>
       openai.chat.completions.create({
-        model: process.env.OPENAI_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL,
-        temperature: 0.15,
+        model: getSummaryModel(),
+        ...temperatureOption(getSummaryModel(), 0.15),
         response_format: { type: "json_object" },
         messages: [
           {
@@ -1264,7 +1294,38 @@ async function withOpenAiRetry<T>(operation: () => Promise<T>, label: string): P
     }
   }
 
-  throw lastError;
+  throw enrichOpenAiError(lastError, label);
+}
+
+// שגיאות הגדרה (מודל לא קיים, פרמטר לא נתמך, חריגת מכסה) חוזרות מ-OpenAI כ-400 יבש באנגלית.
+// כאן מוסיפים הסבר בעברית ושומרים את ההודעה המקורית בסוף, כדי שבדיקות ההודעה בתמלול ימשיכו לעבוד.
+function enrichOpenAiError(error: unknown, label: string) {
+  const message = getSafeErrorMessage(error);
+  const hint = openAiConfigHint(message);
+  if (!hint) return error;
+  return new Error(`${label} נכשל בגלל הגדרות המודל בשרת. ${hint} שגיאת OpenAI המקורית: ${message}`);
+}
+
+function openAiConfigHint(message: string) {
+  const lower = message.toLowerCase();
+
+  if (lower.includes("model_not_found") || lower.includes("does not exist") || lower.includes("do not have access")) {
+    return `המודל שהוגדר לא קיים או לא זמין בחשבון ה-OpenAI. יש לעדכן את OPENAI_SUMMARY_MODEL / OPENAI_CHAT_MODEL / OPENAI_TRANSCRIBE_MODEL. כרגע מוגדרים: סיכום ${getSummaryModel()}, צ׳אט ${getChatModel()}, תמלול ${getTranscribeModel()}.`;
+  }
+
+  if (lower.includes("unsupported value") || lower.includes("unsupported parameter") || lower.includes("unknown parameter")) {
+    return "המודל שהוגדר לא תומך באחד הפרמטרים שנשלחו אליו (למשל temperature). יש לבדוק את הגדרות המודל בשרת דרך /api/debug-openai.";
+  }
+
+  if (lower.includes("insufficient_quota") || lower.includes("exceeded your current quota")) {
+    return "אין יתרה או מכסה זמינה בחשבון ה-OpenAI.";
+  }
+
+  if (lower.includes("invalid_api_key") || lower.includes("incorrect api key")) {
+    return "מפתח ה-OPENAI_API_KEY שהוגדר בשרת אינו תקין.";
+  }
+
+  return "";
 }
 
 function isRetryableOpenAiError(message: string) {
