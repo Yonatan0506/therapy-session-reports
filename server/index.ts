@@ -24,9 +24,14 @@ const upload = multer({
   limits: { fileSize: 150 * 1024 * 1024 }
 });
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
-const DIRECT_TRANSCRIBE_LIMIT_BYTES = Number(process.env.DIRECT_TRANSCRIBE_LIMIT_BYTES || 8 * 1024 * 1024);
+const DIRECT_TRANSCRIBE_LIMIT_BYTES = Number(process.env.DIRECT_TRANSCRIBE_LIMIT_BYTES || 2 * 1024 * 1024);
+const DEFAULT_AUDIO_CHUNK_SECONDS = 120;
+const MAX_AUDIO_CHUNK_SECONDS = Number(process.env.MAX_AUDIO_CHUNK_SECONDS || DEFAULT_AUDIO_CHUNK_SECONDS);
 const PROCESSING_JOB_TTL_MS = Number(process.env.PROCESSING_JOB_TTL_MS || 2 * 60 * 60 * 1000);
 const PROCESSING_MODE = normalizeProcessingMode(process.env.PROCESSING_MODE);
+const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe";
+const DEFAULT_SUMMARY_MODEL = "gpt-5.6-sol";
+const DEFAULT_CHAT_MODEL = "gpt-5.6-sol";
 
 type ProcessingJob = {
   status: "queued" | "processing" | "completed" | "failed";
@@ -62,7 +67,12 @@ app.get("/api/health", (_req, res) => {
     openai: Boolean(openai),
     ffmpeg: Boolean(ffmpegPath),
     cloudStorage: isCloudStorageConfigured(),
-    processingMode: PROCESSING_MODE
+    processingMode: PROCESSING_MODE,
+    chatModel: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
+    summaryModel: process.env.OPENAI_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL,
+    transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL,
+    audioChunkSeconds: getAudioChunkSeconds(),
+    directTranscribeLimitBytes: DIRECT_TRANSCRIBE_LIMIT_BYTES
   });
 });
 
@@ -80,7 +90,7 @@ app.get("/api/debug-openai", async (_req, res) => {
 
   try {
     const completion = await openai.chat.completions.create({
-      model: process.env.OPENAI_CHAT_MODEL || "gpt-4.1-mini",
+      model: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
       temperature: 0,
       messages: [
         { role: "system", content: "ענה במילה אחת בעברית." },
@@ -90,15 +100,15 @@ app.get("/api/debug-openai", async (_req, res) => {
 
     res.json({
       ok: true,
-      chatModel: process.env.OPENAI_CHAT_MODEL || "gpt-4.1-mini",
-      transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe",
+      chatModel: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
+      transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL,
       sample: completion.choices[0]?.message?.content || ""
     });
   } catch (error) {
     res.status(500).json({
       ok: false,
       step: "chat",
-      chatModel: process.env.OPENAI_CHAT_MODEL || "gpt-4.1-mini",
+      chatModel: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
       message: getSafeErrorMessage(error)
     });
   }
@@ -352,7 +362,7 @@ app.post("/api/chat-session", async (req, res) => {
 
   try {
     const completion = await openai.chat.completions.create({
-      model: process.env.OPENAI_CHAT_MODEL || "gpt-4.1-mini",
+      model: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
       temperature: 0.2,
       messages: [
         {
@@ -406,7 +416,7 @@ app.post("/api/progress-summary", async (req, res) => {
     const completion = await withOpenAiRetry(
       () =>
         openai.chat.completions.create({
-          model: process.env.OPENAI_CHAT_MODEL || "gpt-4.1-mini",
+          model: process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL,
           temperature: 0.2,
           messages: [
             {
@@ -854,7 +864,7 @@ async function transcribeBuffer(buffer: Buffer, fileName: string, mimeType: stri
     () =>
       openai.audio.transcriptions.create({
         file: openAiFile,
-        model: process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe",
+        model: process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL,
         response_format: "text",
         language: "he",
         prompt: "השיחה בעברית. תמלל את כל הדיבור הנשמע, גם אם האיכות נמוכה או הדיבור שקט."
@@ -869,7 +879,7 @@ async function transcribeBufferWithFallback(buffer: Buffer, fileName: string, mi
   if (primaryText.trim()) return primaryText;
 
   const fallbackModel = process.env.OPENAI_FALLBACK_TRANSCRIBE_MODEL || "whisper-1";
-  if (fallbackModel === (process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe")) return primaryText;
+  if (fallbackModel === (process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL)) return primaryText;
 
   console.warn("empty_transcription_trying_fallback", label, fallbackModel);
   if (!openai) throw new Error("missing_openai_client");
@@ -918,7 +928,7 @@ async function createAudioChunks(file: Express.Multer.File) {
     "-f",
     "segment",
     "-segment_time",
-    process.env.AUDIO_CHUNK_SECONDS || "240",
+    String(getAudioChunkSeconds()),
     "-reset_timestamps",
     "1",
     outputPattern
@@ -994,6 +1004,15 @@ function isDirectAudioTooLargeError(message: string) {
   return lower.includes("tokens") && lower.includes("audio") && lower.includes("too large");
 }
 
+function getAudioChunkSeconds() {
+  const requested = Number(process.env.AUDIO_CHUNK_SECONDS || DEFAULT_AUDIO_CHUNK_SECONDS);
+  const safeRequested = Number.isFinite(requested) && requested > 0 ? requested : DEFAULT_AUDIO_CHUNK_SECONDS;
+  const safeMaximum = Number.isFinite(MAX_AUDIO_CHUNK_SECONDS) && MAX_AUDIO_CHUNK_SECONDS > 0
+    ? MAX_AUDIO_CHUNK_SECONDS
+    : DEFAULT_AUDIO_CHUNK_SECONDS;
+  return Math.max(30, Math.min(safeRequested, safeMaximum));
+}
+
 function hasMeaningfulTranscript(transcript: string) {
   const withoutSegmentLabels = transcript
     .replace(/\[מקטע \d+\]/g, "")
@@ -1025,7 +1044,7 @@ async function createTherapyReport(session: any, transcript: string) {
   const completion = await withOpenAiRetry(
     () =>
       openai.chat.completions.create({
-        model: process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini",
+        model: process.env.OPENAI_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL,
         temperature: 0.2,
         response_format: { type: "json_object" },
         messages: [
@@ -1103,7 +1122,7 @@ async function rewriteReportInHebrew(session: any, report: any) {
   const completion = await withOpenAiRetry(
     () =>
       openai.chat.completions.create({
-        model: process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini",
+        model: process.env.OPENAI_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL,
         temperature: 0,
         response_format: { type: "json_object" },
         messages: [
@@ -1142,7 +1161,7 @@ async function enrichTherapyReport(session: any, transcript: string, report: any
   const completion = await withOpenAiRetry(
     () =>
       openai.chat.completions.create({
-        model: process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini",
+        model: process.env.OPENAI_SUMMARY_MODEL || DEFAULT_SUMMARY_MODEL,
         temperature: 0.15,
         response_format: { type: "json_object" },
         messages: [
@@ -1356,3 +1375,4 @@ const host = process.env.HOST || (process.env.PORT ? "0.0.0.0" : "127.0.0.1");
 app.listen(port, host, () => {
   console.log(`Server running on http://${host}:${port}`);
 });
+
