@@ -1151,8 +1151,7 @@ function NewSessionView(props: {
       </div>
       <p className="warning">כדי למנוע עצירת הקלטה, מומלץ להשאיר את המסך פתוח עד סיום הפגישה.</p>
       <section className="form-grid">
-        <label>שם מטופל או בחירה קיימת<input list="patients" value={patientName} onChange={(event) => setPatientName(event.target.value)} /></label>
-        <datalist id="patients">{props.patients.map((patient) => <option key={patient.patientId} value={patient.displayName} />)}</datalist>
+        <label>שם מטופל<input value={patientName} autoComplete="off" onChange={(event) => setPatientName(event.target.value)} /></label>
         <label>תאריך פגישה<input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label>
         <label>שעת התחלה<input type="time" value={time} onChange={(event) => setTime(event.target.value)} /></label>
         <label>שם מטפל<input value={props.userName} readOnly /></label>
