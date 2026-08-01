@@ -300,26 +300,39 @@ app.post(
 
     const chunkIndex = parseChunkIndex(req);
 
-    // לקוח מעודכן שולח מספר מקטע, ואז אפשר לשמור כל מקטע כאובייקט נפרד בענן.
-    // לקוח ישן בלי מספר מקטע ממשיך בנתיב הישן של קובץ מקומי.
-    if (isCloudStorageConfigured() && chunkIndex !== null) {
+    // ההעלאה נקבעת לפי איפה שהיא נפתחה, ולא לפי מה שהלקוח שלח: אם קיים meta.json
+    // בענן, כל המקטעים של אותה העלאה חייבים להישמר בענן. אחרת לקוח ישן שלא שולח
+    // מספר מקטע היה נופל לנתיב המקומי ומקבל upload_not_found כבר במקטע הראשון.
+    if (isCloudStorageConfigured()) {
       const meta = await downloadJson<CloudUploadMeta>(uploadMetaObjectName(jobId)).catch(() => null);
-      if (!meta) {
-        res.status(404).json({ error: "upload_not_found", message: "העלאת האודיו לא נמצאה. נסה להתחיל מחדש." });
+      if (meta) {
+        let index = chunkIndex;
+
+        // לקוח ישן לא שולח מספר מקטע. הוא מעלה בטור וממתין לכל תשובה, ולכן מספר
+        // המקטעים שכבר נשמרו הוא המספר הסידורי הבא.
+        if (index === null) {
+          try {
+            index = (await listObjects(uploadPartsPrefix(jobId))).length;
+          } catch (error) {
+            const message = getSafeErrorMessage(error);
+            console.error("cloud_chunk_index_lookup_failed", jobId, message);
+            res.status(500).json({ error: "chunk_upload_failed", message: `בדיקת מקטעי האודיו בענן נכשלה. ${message}` });
+            return;
+          }
+        }
+
+        try {
+          await uploadObject(uploadPartObjectName(jobId, index), chunk, "application/octet-stream");
+        } catch (error) {
+          const message = getSafeErrorMessage(error);
+          console.error("cloud_chunk_upload_failed", jobId, index, message);
+          res.status(500).json({ error: "chunk_upload_failed", message: `שמירת מקטע האודיו בענן נכשלה. ${message}` });
+          return;
+        }
+
+        res.json({ ok: true, index, receivedBytes: chunk.length, expectedBytes: meta.size });
         return;
       }
-
-      try {
-        await uploadObject(uploadPartObjectName(jobId, chunkIndex), chunk, "application/octet-stream");
-      } catch (error) {
-        const message = getSafeErrorMessage(error);
-        console.error("cloud_chunk_upload_failed", jobId, chunkIndex, message);
-        res.status(500).json({ error: "chunk_upload_failed", message: `שמירת מקטע האודיו בענן נכשלה. ${message}` });
-        return;
-      }
-
-      res.json({ ok: true, index: chunkIndex, receivedBytes: chunk.length, expectedBytes: meta.size });
-      return;
     }
 
     const uploadJob = uploadJobs.get(jobId);
