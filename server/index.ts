@@ -29,7 +29,7 @@ const DEFAULT_AUDIO_CHUNK_SECONDS = 120;
 const MAX_AUDIO_CHUNK_SECONDS = Number(process.env.MAX_AUDIO_CHUNK_SECONDS || DEFAULT_AUDIO_CHUNK_SECONDS);
 const PROCESSING_JOB_TTL_MS = Number(process.env.PROCESSING_JOB_TTL_MS || 2 * 60 * 60 * 1000);
 const PROCESSING_MODE = normalizeProcessingMode(process.env.PROCESSING_MODE);
-const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe";
+const DEFAULT_TRANSCRIBE_MODEL = "gpt-transcribe";
 const DEFAULT_SUMMARY_MODEL = "gpt-5.6-sol";
 const DEFAULT_CHAT_MODEL = "gpt-5.6-sol";
 
@@ -860,15 +860,16 @@ async function transcribeAudio(file: Express.Multer.File) {
 async function transcribeBuffer(buffer: Buffer, fileName: string, mimeType: string, label: string) {
   if (!openai) throw new Error("missing_openai_client");
   const openAiFile = await toFile(buffer, fileName, { type: mimeType });
+  const model = process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL;
   return withOpenAiRetry(
     () =>
       openai.audio.transcriptions.create({
         file: openAiFile,
-        model: process.env.OPENAI_TRANSCRIBE_MODEL || DEFAULT_TRANSCRIBE_MODEL,
+        model,
         response_format: "text",
-        language: "he",
+        ...(model === "gpt-transcribe" ? { languages: ["he"] } : { language: "he" }),
         prompt: "השיחה בעברית. תמלל את כל הדיבור הנשמע, גם אם האיכות נמוכה או הדיבור שקט."
-      }),
+      } as any),
     label
   );
 }
