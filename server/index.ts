@@ -653,12 +653,12 @@ async function processSessionAudio(session: any, file: Express.Multer.File) {
   }
   let aiReport = normalizeAiReport(await createTherapyReport(session, transcript), transcript);
   if (!reportLooksHebrew(aiReport)) {
-    aiReport = normalizeAiReport(await rewriteReportInHebrew(session, aiReport), transcript);
+    aiReport = await refineReport(aiReport, "שכתוב לעברית", () => rewriteReportInHebrew(session, aiReport));
   }
   if (!reportLooksDetailed(aiReport)) {
-    aiReport = normalizeAiReport(await enrichTherapyReport(session, transcript, aiReport), transcript);
+    aiReport = await refineReport(aiReport, "העמקת הדוח", () => enrichTherapyReport(session, transcript, aiReport), true);
     if (!reportLooksHebrew(aiReport)) {
-      aiReport = normalizeAiReport(await rewriteReportInHebrew(session, aiReport), transcript);
+      aiReport = await refineReport(aiReport, "שכתוב לעברית", () => rewriteReportInHebrew(session, aiReport));
     }
   }
 
@@ -1312,7 +1312,7 @@ ${isIntake ? `זהו דוח אינטייק. מיפוי השדות להצגה:
     "יצירת דוח"
   );
 
-  return JSON.parse(completion.choices[0]?.message?.content || "{}");
+  return parseReportJson(completion, "יצירת הדוח");
 }
 
 async function rewriteReportInHebrew(session: any, report: any) {
@@ -1350,7 +1350,7 @@ async function rewriteReportInHebrew(session: any, report: any) {
     "תיקון שפת הדוח לעברית"
   );
 
-  return JSON.parse(completion.choices[0]?.message?.content || "{}");
+  return parseReportJson(completion, "שכתוב הדוח לעברית");
 }
 
 async function enrichTherapyReport(session: any, transcript: string, report: any) {
@@ -1408,7 +1408,7 @@ async function enrichTherapyReport(session: any, transcript: string, report: any
     "העמקת איכות הדוח"
   );
 
-  return JSON.parse(completion.choices[0]?.message?.content || "{}");
+  return parseReportJson(completion, "העמקת הדוח");
 }
 
 function reportLooksHebrew(report: any) {
@@ -1485,8 +1485,13 @@ function openAiConfigHint(message: string) {
     return "המודל שהוגדר לא תומך באחד הפרמטרים שנשלחו אליו (למשל temperature). יש לבדוק את הגדרות המודל בשרת דרך /api/debug-openai.";
   }
 
-  if (lower.includes("insufficient_quota") || lower.includes("exceeded your current quota")) {
-    return "אין יתרה או מכסה זמינה בחשבון ה-OpenAI.";
+  if (
+    lower.includes("insufficient_quota") ||
+    lower.includes("exceeded your current quota") ||
+    lower.includes("no credits remaining") ||
+    lower.includes("credit_balance_exhausted")
+  ) {
+    return "אין יתרה בחשבון ה-OpenAI. יש לטעון קרדיט בכתובת https://platform.openai.com/settings/organization/billing/ ואז לנסות שוב.";
   }
 
   if (lower.includes("invalid_api_key") || lower.includes("incorrect api key")) {
@@ -1512,7 +1517,63 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// תשובה ריקה או JSON פגום הם הסיבה הנפוצה לכך ששלב בשרשרת הדוח לא מתמפה.
+// בלי תיעוד של finish_reason ו-refusal אי אפשר לדעת בדיעבד מה קרה.
+function parseReportJson(completion: any, label: string) {
+  const choice = completion?.choices?.[0];
+  const content = choice?.message?.content || "";
+
+  if (!content.trim()) {
+    console.warn(
+      "model_returned_empty_content",
+      label,
+      JSON.stringify({
+        finishReason: choice?.finish_reason,
+        refusal: choice?.message?.refusal || null,
+        completionTokens: completion?.usage?.completion_tokens,
+        reasoningTokens: completion?.usage?.completion_tokens_details?.reasoning_tokens
+      })
+    );
+    return {};
+  }
+
+  try {
+    return JSON.parse(content);
+  } catch (error) {
+    console.warn(
+      "model_returned_invalid_json",
+      label,
+      JSON.stringify({
+        finishReason: choice?.finish_reason,
+        contentLength: content.length,
+        contentTail: content.slice(-160)
+      })
+    );
+    return {};
+  }
+}
+
+// שלב שיפור שנכשל לא אמור למחוק דוח תקין שכבר הופק. אם התשובה לא מתמפה לשדות
+// הדוח, נשמר הדוח הקודם ונרשם ללוג למה השלב נכשל.
+async function refineReport(current: any, label: string, run: () => Promise<any>, allowRetry = false) {
+  const mapped = mapAiReport(await run());
+  if (mapped) return mapped;
+
+  if (allowRetry) {
+    console.warn("refinement_step_unmapped_retrying", label);
+    const retried = mapAiReport(await run());
+    if (retried) return retried;
+  }
+
+  console.warn("refinement_step_unmapped_keeping_previous_report", label);
+  return current;
+}
+
 function normalizeAiReport(raw: any, transcript: string) {
+  return mapAiReport(raw) || buildUnmappedReport(transcript);
+}
+
+function mapAiReport(raw: any) {
   const source = raw?.report || raw?.sessionReport || raw?.["דוח"] || raw || {};
   const internal = raw?.internalSessionMemory || source?.internalSessionMemory || {};
 
@@ -1531,24 +1592,29 @@ function normalizeAiReport(raw: any, transcript: string) {
   const hasContent = [meetingTopic, sessionNarrative, therapeuticInsights, administrativeNotes, crmSummary, ...followUpPoints]
     .some((value) => String(value || "").trim().length > 0);
 
-  if (hasContent) {
-    return {
-      meetingTopic,
-      sessionNarrative,
-      therapeuticInsights,
-      followUpPoints,
-      administrativeNotes,
-      crmSummary,
-      internalSessionMemory: {
-        factsFromSession: pickArray(internal, ["factsFromSession", "facts", "עובדות מהפגישה"]),
-        aiInterpretations: pickArray(internal, ["aiInterpretations", "interpretations", "פרשנויות"]),
-        interventions: pickArray(internal, ["interventions", "התערבויות"]),
-        riskOrUncertaintyNotes: pickArray(internal, ["riskOrUncertaintyNotes", "uncertainties", "אי ודאות"]),
-        openQuestionsForNextSession: pickArray(internal, ["openQuestionsForNextSession", "openQuestions", "שאלות להמשך"])
-      }
-    };
+  if (!hasContent) {
+    console.warn("ai_report_unmapped", JSON.stringify({ topLevelKeys: Object.keys(raw || {}).slice(0, 12) }));
+    return null;
   }
 
+  return {
+    meetingTopic,
+    sessionNarrative,
+    therapeuticInsights,
+    followUpPoints,
+    administrativeNotes,
+    crmSummary,
+    internalSessionMemory: {
+      factsFromSession: pickArray(internal, ["factsFromSession", "facts", "עובדות מהפגישה"]),
+      aiInterpretations: pickArray(internal, ["aiInterpretations", "interpretations", "פרשנויות"]),
+      interventions: pickArray(internal, ["interventions", "התערבויות"]),
+      riskOrUncertaintyNotes: pickArray(internal, ["riskOrUncertaintyNotes", "uncertainties", "אי ודאות"]),
+      openQuestionsForNextSession: pickArray(internal, ["openQuestionsForNextSession", "openQuestions", "שאלות להמשך"])
+    }
+  };
+}
+
+function buildUnmappedReport(transcript: string) {
   const transcriptPreview = transcript.trim().slice(0, 900);
   return {
     meetingTopic: "לא זוהה נושא מובנה בתשובת המודל",
