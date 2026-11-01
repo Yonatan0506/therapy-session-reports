@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { mapWithConcurrency } from "./parallel";
 import {
   buildObjectName,
   composeObjects,
@@ -32,8 +33,13 @@ const MAX_AUDIO_CHUNK_SECONDS = Number(process.env.MAX_AUDIO_CHUNK_SECONDS || DE
 const PROCESSING_JOB_TTL_MS = Number(process.env.PROCESSING_JOB_TTL_MS || 2 * 60 * 60 * 1000);
 const PROCESSING_MODE = normalizeProcessingMode(process.env.PROCESSING_MODE);
 const DEFAULT_TRANSCRIBE_MODEL = "gpt-transcribe";
-const DEFAULT_SUMMARY_MODEL = "gpt-5.6-sol";
-const DEFAULT_CHAT_MODEL = "gpt-5.6-sol";
+const DEFAULT_SUMMARY_MODEL = "gpt-6.1-terra";
+const DEFAULT_CHAT_MODEL = "gpt-6.1-terra";
+
+function getTranscriptionConcurrency() {
+  const requested = Number(process.env.TRANSCRIPTION_CONCURRENCY || 3);
+  return Number.isFinite(requested) ? Math.max(1, Math.min(6, Math.floor(requested))) : 3;
+}
 
 function getChatModel() {
   return process.env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL;
@@ -49,10 +55,11 @@ function getTranscribeModel() {
 
 // מודלי gpt-5 ו-o* מקבלים רק את ברירת המחדל של temperature ומחזירים 400 על כל ערך אחר.
 function supportsCustomTemperature(model: string) {
-  return !/^(gpt-5|o[1-9])/i.test(model.trim());
+  return !/^(gpt-[56]|o[1-9])/i.test(model.trim());
 }
 
 function temperatureOption(model: string, temperature: number) {
+  if (/^gpt-6/i.test(model.trim())) return { reasoning_effort: "low" as const };
   return supportsCustomTemperature(model) ? { temperature } : {};
 }
 
@@ -104,6 +111,7 @@ app.get("/api/health", (_req, res) => {
     summaryModel: getSummaryModel(),
     transcribeModel: getTranscribeModel(),
     audioChunkSeconds: getAudioChunkSeconds(),
+    transcriptionConcurrency: getTranscriptionConcurrency(),
     directTranscribeLimitBytes: DIRECT_TRANSCRIBE_LIMIT_BYTES
   });
 });
@@ -1030,25 +1038,26 @@ async function transcribeAudio(file: Express.Multer.File) {
   }
 
   const chunks = await createAudioChunks(file);
-  const transcripts: string[] = [];
+  let transcripts: string[];
 
   try {
-    for (const [index, chunk] of chunks.entries()) {
+    transcripts = await mapWithConcurrency(chunks, getTranscriptionConcurrency(), async (chunk, index) => {
       const buffer = await readFile(chunk);
       const transcription = await transcribeBufferWithFallback(buffer, path.basename(chunk), "audio/mpeg", `תמלול מקטע ${index + 1}`);
 
       const text = typeof transcription === "string" ? transcription : String(transcription);
       if (text.trim()) {
-        transcripts.push(`[מקטע ${index + 1}]\n${text.trim()}`);
+        return `[מקטע ${index + 1}]\n${text.trim()}`;
       } else {
         console.warn("empty_transcription_chunk", index + 1, path.basename(chunk), buffer.length);
+        return "";
       }
-    }
+    });
   } finally {
     await cleanupChunks(chunks);
   }
 
-  const transcript = transcripts.join("\n\n");
+  const transcript = transcripts.filter(Boolean).join("\n\n");
   if (!hasMeaningfulTranscript(transcript)) {
     throw new Error("התמלול מהאודיו יצא ריק בכל המקטעים. ייתכן שההקלטה שקטה מדי או שהפורמט לא פוענח נכון.");
   }
