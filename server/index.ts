@@ -12,11 +12,13 @@ import { mapWithConcurrency } from "./parallel";
 import {
   buildObjectName,
   composeObjects,
+  createResumableUpload,
   deleteObject,
   downloadJson,
   downloadObject,
   isCloudStorageConfigured,
   listObjects,
+  getObjectSize,
   uploadJson,
   uploadObject
 } from "./cloudStorage";
@@ -64,6 +66,8 @@ function temperatureOption(model: string, temperature: number) {
 }
 
 type ProcessingJob = {
+  transcriptOnly?: boolean;
+  segmentJobIds?: string[];
   status: "queued" | "processing" | "completed" | "failed";
   createdAt: string;
   updatedAt: string;
@@ -79,6 +83,9 @@ type ProcessingJob = {
 
 // פרטי העלאה מקוטעת שנשמרים בענן, כדי שכל instance של Cloud Run יוכל לטפל בכל מקטע.
 type CloudUploadMeta = {
+  uploadUrl?: string;
+  audioObjectName?: string;
+  transcriptOnly?: boolean;
   session: any;
   originalname: string;
   mimetype: string;
@@ -87,7 +94,9 @@ type CloudUploadMeta = {
 };
 
 const processingJobs = new Map<string, ProcessingJob>();
+const pendingJobWrites = new Map<string, Promise<void>>();
 const activeCloudJobs = new Set<string>();
+let activeAudioJobs = 0;
 const uploadJobs = new Map<string, {
   session: any;
   filePath: string;
@@ -112,6 +121,8 @@ app.get("/api/health", (_req, res) => {
     transcribeModel: getTranscribeModel(),
     audioChunkSeconds: getAudioChunkSeconds(),
     transcriptionConcurrency: getTranscriptionConcurrency(),
+    directUpload: true,
+    liveProcessing: true,
     directTranscribeLimitBytes: DIRECT_TRANSCRIBE_LIMIT_BYTES
   });
 });
@@ -246,6 +257,14 @@ app.post("/api/process-session-upload", async (req, res) => {
   const originalname = String(req.body?.fileName || `recording-${session.sessionId || crypto.randomUUID()}.m4a`);
   const mimetype = String(req.body?.mimeType || "application/octet-stream");
   const size = Number(req.body?.size || 0);
+  if (!Number.isSafeInteger(size) || size <= 0 || size > 150 * 1024 * 1024) {
+    res.status(400).json({ message: "גודל קובץ האודיו אינו תקין או גדול מ-150MB." });
+    return;
+  }
+  if (req.body?.transport === "resumable" && !isCloudStorageConfigured()) {
+    res.status(409).json({ error: "direct_upload_unavailable" });
+    return;
+  }
 
   if (!openai) {
     res.status(500).json({
@@ -263,6 +282,11 @@ app.post("/api/process-session-upload", async (req, res) => {
   if (isCloudStorageConfigured()) {
     const meta: CloudUploadMeta = { session, originalname, mimetype, size, createdAt: now };
     try {
+      if (req.body?.transport === "resumable") {
+        meta.audioObjectName = buildAudioObjectName(jobId, session, originalname);
+        meta.uploadUrl = await createResumableUpload(meta.audioObjectName, size, mimetype, req.header("origin"));
+        meta.transcriptOnly = req.body?.transcriptOnly === true;
+      }
       await uploadJson(uploadMetaObjectName(jobId), meta);
     } catch (error) {
       const message = getSafeErrorMessage(error);
@@ -274,7 +298,8 @@ app.post("/api/process-session-upload", async (req, res) => {
     const job: ProcessingJob = { status: "queued", createdAt: now, updatedAt: now, stage: "uploading_audio", session };
     processingJobs.set(jobId, job);
     await persistProcessingJob(jobId, job);
-    res.status(202).json({ jobId, status: "uploading", storage: "cloud" });
+    res.setHeader("Cache-Control", "no-store");
+    res.status(202).json({ jobId, status: "uploading", storage: "cloud", uploadUrl: meta.uploadUrl });
     return;
   }
 
@@ -293,6 +318,13 @@ app.post("/api/process-session-upload", async (req, res) => {
   });
 
   res.status(202).json({ jobId, status: "uploading", storage: "local" });
+});
+
+app.get("/api/process-session-upload/:jobId/resumable", async (req, res) => {
+  const meta = await downloadJson<CloudUploadMeta>(uploadMetaObjectName(req.params.jobId));
+  if (!meta?.uploadUrl) { res.status(404).json({ error: "upload_not_found" }); return; }
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ uploadUrl: meta.uploadUrl, size: meta.size });
 });
 
 app.post(
@@ -371,6 +403,25 @@ app.post("/api/process-session-upload/:jobId/complete", async (req, res) => {
       return;
     }
 
+    if (meta.uploadUrl && meta.audioObjectName) {
+      const receivedSize = await getObjectSize(meta.audioObjectName);
+      if (receivedSize !== meta.size) {
+        res.status(409).json({ message: "האודיו עדיין לא הועלה במלואו לענן." });
+        return;
+      }
+      const now = new Date().toISOString();
+      const job: ProcessingJob = {
+        status: "queued", stage: "queued_for_background_processing", createdAt: now, updatedAt: now,
+        session: meta.session, audioObjectName: meta.audioObjectName, originalname: meta.originalname,
+        mimetype: meta.mimetype, size: meta.size, transcriptOnly: meta.transcriptOnly
+      };
+      processingJobs.set(jobId, job);
+      await persistProcessingJob(jobId, job);
+      res.status(202).json({ jobId, status: "queued" });
+      if (shouldRunCloudJobInline()) void runCloudProcessingJob(jobId);
+      return;
+    }
+
     // טוען את העבודה מהענן לזיכרון של ה-instance הנוכחי כדי שעדכוני הסטטוס יתפסו.
     await getProcessingJob(jobId);
     const expectedChunks = Number(req.body?.totalChunks || 0);
@@ -412,6 +463,7 @@ app.get("/api/process-session-job/:jobId", async (req, res) => {
   if (shouldRunCloudJobInline() && job.audioObjectName && (job.status === "queued" || job.status === "processing")) {
     void runCloudProcessingJob(req.params.jobId);
   }
+  if (job.segmentJobIds && (job.status === "queued" || job.status === "processing")) void runLiveReportJob(req.params.jobId);
 
   if (job.status === "completed") {
     res.json({ status: job.status, result: job.result });
@@ -425,6 +477,65 @@ app.get("/api/process-session-job/:jobId", async (req, res) => {
 
   res.json({ status: job.status, stage: job.stage, message: job.message });
 });
+
+app.post("/api/process-live-report", async (req, res) => {
+  const session = parseSession(req.body?.session);
+  const ids = req.body?.segmentJobIds;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > 180 || new Set(ids).size !== ids.length ||
+      !ids.every((id: unknown) => typeof id === "string" && /^[a-f0-9-]{36}$/i.test(id))) {
+    res.status(400).json({ message: "רשימת מקטעי ההקלטה אינה תקינה." }); return;
+  }
+  for (const id of ids) {
+    const segment = await getProcessingJob(id);
+    if (!segment?.transcriptOnly || segment.session?.sessionId !== session.sessionId) {
+      res.status(400).json({ message: "מקטע הקלטה חסר או שייך לפגישה אחרת." }); return;
+    }
+  }
+  // The ordered segment IDs also make repeated completion requests idempotent.
+  const stableId = ids[0] + "-report";
+  let job = await getProcessingJob(stableId);
+  if (job && JSON.stringify(job.segmentJobIds) !== JSON.stringify(ids)) {
+    res.status(409).json({ message: "כבר קיימת בקשת דוח עם רשימת מקטעים אחרת." }); return;
+  }
+  if (!job || job.status === "failed") {
+    const now = new Date().toISOString();
+    job = { status: "queued", stage: "waiting_for_live_segments", createdAt: now, updatedAt: now, session, segmentJobIds: ids };
+    processingJobs.set(stableId, job);
+    await persistProcessingJob(stableId, job);
+  }
+  res.status(202).json({ jobId: stableId });
+  void runLiveReportJob(stableId);
+});
+
+async function runLiveReportJob(jobId: string) {
+  if (activeCloudJobs.has(jobId)) return;
+  activeCloudJobs.add(jobId);
+  try {
+    const job = await getProcessingJob(jobId);
+    if (!job?.segmentJobIds || job.status === "completed") return;
+    updateProcessingJob(jobId, { status: "processing", stage: "waiting_for_live_segments" });
+    const started = Date.now();
+    let transcripts: string[] = [];
+    while (Date.now() - started < 45 * 60 * 1000) {
+      const segments = await Promise.all(job.segmentJobIds.map((id) => downloadJson<ProcessingJob>(jobObjectName(id))));
+      if (segments.some((segment) => segment?.status === "failed")) throw new Error("תמלול אחד ממקטעי ההקלטה נכשל. ההקלטה המלאה עדיין זמינה במכשיר לניסיון חוזר.");
+      if (segments.every((segment) => segment?.status === "completed")) {
+        transcripts = segments.map((segment, index) => `[מקטע ${index + 1}]\n${String((segment?.result as { transcript?: string })?.transcript || "")}`);
+        break;
+      }
+      for (let index = 0; index < segments.length; index++) {
+        if (segments[index]?.status === "queued") void runCloudProcessingJob(job.segmentJobIds[index]);
+      }
+      await delay(5000);
+    }
+    if (!transcripts.length) throw new Error("מקטעי ההקלטה טרם סיימו להתעבד. אפשר לנסות שוב מאוחר יותר.");
+    updateProcessingJob(jobId, { stage: "summarizing_live_transcript" });
+    const result = await processSessionTranscript(job.session, transcripts.join("\n\n"));
+    await completeCloudJob(jobId, result);
+  } catch (error) {
+    updateProcessingJob(jobId, { status: "failed", message: getSafeErrorMessage(error) });
+  } finally { activeCloudJobs.delete(jobId); }
+}
 
 app.post("/api/internal/process-job", async (req, res) => {
   if (!authorizeWorkerRequest(req)) {
@@ -660,9 +771,12 @@ function buildDemoSession(session: any, now: string) {
 }
 
 async function processSessionAudio(session: any, file: Express.Multer.File) {
+  return processSessionTranscript(session, await transcribeAudio(file));
+}
+
+async function processSessionTranscript(session: any, transcript: string) {
   const now = new Date().toISOString();
   const fallback = buildDemoSession(session, now);
-  const transcript = await transcribeAudio(file);
   if (!hasMeaningfulTranscript(transcript)) {
     throw new Error("התמלול מהאודיו יצא ריק. ייתכן שהקובץ הוקלט בעוצמה נמוכה, שהמיקרופון נחסם, או שמודל התמלול לא הצליח לפענח את ההקלטה. מומלץ לבדוק שהאודיו נשמע ברור ולנסות שוב.");
   }
@@ -863,8 +977,9 @@ function uploadPartObjectName(jobId: string, index: number) {
 }
 
 async function runCloudProcessingJob(jobId: string) {
-  if (activeCloudJobs.has(jobId)) return;
+  if (activeCloudJobs.has(jobId) || activeAudioJobs >= 3) return;
   activeCloudJobs.add(jobId);
+  activeAudioJobs++;
 
   try {
     const job = await getProcessingJob(jobId);
@@ -878,8 +993,8 @@ async function runCloudProcessingJob(jobId: string) {
     const buffer = await downloadObject(job.audioObjectName);
     const file = buildCloudFile(job, buffer);
     updateProcessingJob(jobId, { status: "processing", stage: "transcribing_and_summarizing" });
-    const result = await processSessionAudio(job.session, file);
-    updateProcessingJob(jobId, { status: "completed", stage: "completed", result });
+    const result = job.transcriptOnly ? { transcript: await transcribeAudio(file) } : await processSessionAudio(job.session, file);
+    await completeCloudJob(jobId, result);
 
     if (process.env.DELETE_CLOUD_AUDIO_AFTER_SUCCESS !== "false") {
       await deleteObject(job.audioObjectName).catch((error) => {
@@ -892,8 +1007,18 @@ async function runCloudProcessingJob(jobId: string) {
     updateProcessingJob(jobId, { status: "failed", stage: "failed", message });
   } finally {
     activeCloudJobs.delete(jobId);
+    activeAudioJobs--;
     setTimeout(() => processingJobs.delete(jobId), PROCESSING_JOB_TTL_MS).unref?.();
   }
+}
+
+async function completeCloudJob(jobId: string, result: unknown) {
+  const current = processingJobs.get(jobId);
+  if (!current) throw new Error("Processing job missing");
+  const completed: ProcessingJob = { ...current, status: "completed", stage: "completed", result, updatedAt: new Date().toISOString() };
+  // Persist the result before removing its audio source.
+  await writeProcessingJob(jobId, completed);
+  processingJobs.set(jobId, completed);
 }
 
 async function runProcessingJob(jobId: string, session: any, file: Express.Multer.File) {
@@ -948,9 +1073,10 @@ function updateProcessingJob(jobId: string, patch: Partial<ProcessingJob>) {
 
 async function getProcessingJob(jobId: string) {
   const inMemory = processingJobs.get(jobId);
-  if (inMemory) return inMemory;
-  if (!isCloudStorageConfigured()) return null;
+  if (inMemory && (!isCloudStorageConfigured() || activeCloudJobs.has(jobId) || Date.now() - Date.parse(inMemory.updatedAt) < 3000)) return inMemory;
+  if (!isCloudStorageConfigured()) return inMemory || null;
   const persisted = await downloadJson<ProcessingJob>(jobObjectName(jobId));
+  if (inMemory && (!persisted || Date.parse(inMemory.updatedAt) > Date.parse(persisted.updatedAt))) return inMemory;
   if (persisted) processingJobs.set(jobId, persisted);
   return persisted;
 }
@@ -958,10 +1084,19 @@ async function getProcessingJob(jobId: string) {
 async function persistProcessingJob(jobId: string, job: ProcessingJob) {
   if (!isCloudStorageConfigured()) return;
   try {
-    await uploadJson(jobObjectName(jobId), job);
+    await writeProcessingJob(jobId, job);
   } catch (error) {
     console.warn("persist_processing_job_failed", jobId, getSafeErrorMessage(error));
   }
+}
+
+function writeProcessingJob(jobId: string, job: ProcessingJob) {
+  const task = (pendingJobWrites.get(jobId) || Promise.resolve()).catch(() => undefined)
+    .then(() => uploadJson(jobObjectName(jobId), job));
+  pendingJobWrites.set(jobId, task);
+  const cleanup = () => { if (pendingJobWrites.get(jobId) === task) pendingJobWrites.delete(jobId); };
+  void task.then(cleanup, cleanup);
+  return task;
 }
 
 function jobObjectName(jobId: string) {
@@ -1684,7 +1819,7 @@ if (existsSync(distPath)) {
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || (process.env.PORT ? "0.0.0.0" : "127.0.0.1");
 
-app.listen(port, host, () => {
+export const httpServer = app.listen(port, host, () => {
   console.log(`Server running on http://${host}:${port}`);
 });
 

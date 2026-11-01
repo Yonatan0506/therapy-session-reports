@@ -158,6 +158,31 @@ export async function uploadJson(objectName: string, value: unknown) {
   await uploadObject(objectName, Buffer.from(JSON.stringify(value, null, 2), "utf8"), "application/json; charset=utf-8");
 }
 
+export async function createResumableUpload(objectName: string, size: number, contentType: string, origin?: string) {
+  const token = await getAccessToken();
+  const url = new URL(`https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(requireBucket())}/o`);
+  url.searchParams.set("uploadType", "resumable");
+  url.searchParams.set("name", objectName);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Upload-Content-Type": contentType, "X-Upload-Content-Length": String(size), ...(origin ? { Origin: origin } : {}) },
+    body: JSON.stringify({ contentType })
+  });
+  if (!response.ok) throw new Error(`Could not start cloud upload (${response.status})`);
+  const location = response.headers.get("location");
+  if (!location || new URL(location).hostname !== "storage.googleapis.com") throw new Error("Invalid cloud upload endpoint");
+  return location;
+}
+
+export async function getObjectSize(objectName: string) {
+  const token = await getAccessToken();
+  const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(requireBucket())}/o/${encodeURIComponent(objectName)}?fields=size`;
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Could not verify cloud upload (${response.status})`);
+  return Number(((await response.json()) as { size: string }).size);
+}
+
 export async function downloadJson<T>(objectName: string): Promise<T | null> {
   try {
     const buffer = await downloadObject(objectName);

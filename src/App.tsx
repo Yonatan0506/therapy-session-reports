@@ -34,6 +34,7 @@ import {
   createProgressSummary,
   getProcessingHealth,
   processAudioDraft,
+  processLiveAudio,
   resumeProcessingJob,
   type ProcessingHealth,
   type ProcessingUpdate
@@ -53,6 +54,7 @@ import {
 } from "./googleDrive";
 import { deletePendingAudio, getPendingAudio, savePendingAudio } from "./offlineAudio";
 import { storage } from "./storage";
+import { nativeTransfer, registerNativeAudio } from "./nativeTransfer";
 import type { Patient, SessionReport, TherapySession } from "./types";
 
 declare global {
@@ -71,9 +73,10 @@ declare global {
           signOut?: () => Promise<void>;
         };
         NativeRecorder?: {
-          startRecording: () => Promise<{ recording: boolean; startedAt?: number }>;
+          startRecording: (options?: { sessionId?: string }) => Promise<{ recording: boolean; startedAt?: number }>;
           getStatus?: () => Promise<{ recording: boolean; startedAt?: number; sizeBytes?: number; lastError?: string }>;
-          stopRecording: () => Promise<{ path: string; name: string; mimeType: string; durationMs?: number; sizeBytes?: number }>;
+          stopRecording: () => Promise<{ path: string; name: string; mimeType: string; durationMs?: number; sizeBytes?: number; liveManifest?: string; sessionId?: string }>;
+          getLiveSegments?: (options: { path: string }) => Promise<{ ready: boolean; segmentJobIds: string[]; sessionId: string; totalSegments: number }>;
         };
       };
     };
@@ -587,6 +590,16 @@ export function App() {
             upsertSession(session);
             setSelectedSessionId(session.sessionId);
           }}
+          onAudioSaved={(sessionId, metadata) => {
+            setSessions((current) => {
+              const next = current.map((item) => item.sessionId === sessionId ? { ...item, ...metadata } : item);
+              storage.saveSessions(next);
+              syncToDrive(patients, next);
+              return next;
+            });
+            setAppMessage("האודיו המקורי נשמר ב-Google Drive.");
+          }}
+          onAudioSaveFailed={() => setAppMessage("הדוח מוכן, אך שמירת האודיו ב-Drive נכשלה. ההקלטה נשמרת במכשיר לניסיון חוזר.")}
         />
       )}
 
@@ -929,6 +942,8 @@ function NewSessionView(props: {
   onCreatePatient: (displayName: string) => Patient;
   onSaved: (session: TherapySession) => void;
   onProcessingStarted: (session: TherapySession) => void;
+  onAudioSaved: (sessionId: string, metadata: Pick<TherapySession, "audioStored" | "audioFileName" | "audioMimeType">) => void;
+  onAudioSaveFailed: () => void;
 }) {
   const [patientName, setPatientName] = useState("");
   const [date, setDate] = useState(today());
@@ -947,11 +962,16 @@ function NewSessionView(props: {
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
   const nativeStartedAtRef = useRef<number | null>(null);
+  const recordingSessionIdRef = useRef<string | null>(null);
+  const liveManifestRef = useRef<string | null>(null);
 
   async function startRecording() {
     try {
       if (isNativeRecorderAvailable()) {
-        const result = await window.Capacitor!.Plugins!.NativeRecorder!.startRecording();
+        const sessionId = uuid();
+        recordingSessionIdRef.current = sessionId;
+        liveManifestRef.current = null;
+        const result = await window.Capacitor!.Plugins!.NativeRecorder!.startRecording(nativeTransfer() ? { sessionId } : {});
         const startedAt = result.startedAt || Date.now();
         nativeStartedAtRef.current = startedAt;
         setRecordedBlob(null);
@@ -971,7 +991,7 @@ function NewSessionView(props: {
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      const recorder = new MediaRecorder(stream, { audioBitsPerSecond: 64000 });
       chunksRef.current = [];
       setRecordedBlob(null);
       setSeconds(0);
@@ -1001,7 +1021,11 @@ function NewSessionView(props: {
         const webPath = window.Capacitor!.convertFileSrc ? window.Capacitor!.convertFileSrc(result.path) : result.path;
         const response = await fetch(webPath);
         const blob = await response.blob();
-        setRecordedBlob(new Blob([blob], { type: result.mimeType || "audio/mp4" }));
+        const audio = new Blob([blob], { type: result.mimeType || "audio/mp4" });
+        registerNativeAudio(audio, result.path);
+        liveManifestRef.current = result.liveManifest || null;
+        if (result.sessionId) recordingSessionIdRef.current = result.sessionId;
+        setRecordedBlob(audio);
         const durationSeconds = result.durationMs ? Math.round(result.durationMs / 1000) : 0;
         const sizeMb = result.sizeBytes ? (result.sizeBytes / 1024 / 1024).toFixed(1) : "";
         setSeconds(durationSeconds || seconds);
@@ -1066,40 +1090,13 @@ function NewSessionView(props: {
       participants,
       sessionType
     });
+    if (recordingSessionIdRef.current && props.mode === "recording") session.sessionId = recordingSessionIdRef.current;
     let sessionForProcessing = session;
-    let storedAudioMeta: Pick<TherapySession, "audioStored" | "audioFileName" | "audioMimeType"> | null = null;
     setIsProcessing(true);
     try {
-      if (saveOriginalAudio && props.googleAccessToken) {
-        const audioFileName = buildAudioFileName(session, audio, file?.name);
-        try {
-          await uploadSessionAudioToDrive(props.googleAccessToken, session, audio, audioFileName);
-          storedAudioMeta = {
-            audioStored: true,
-            audioFileName,
-            audioMimeType: audio.type || "application/octet-stream"
-          };
-          sessionForProcessing = {
-            ...session,
-            ...storedAudioMeta,
-            updatedAt: new Date().toISOString()
-          };
-          setRecordingMessage("קובץ האודיו המקורי נשמר ב-Google Drive. ממשיך לעיבוד הדוח.");
-        } catch (error) {
-          if (isGoogleAuthError(error)) {
-            disconnectGoogleDrive();
-          }
-          const message = error instanceof Error ? error.message : "שמירת האודיו ל-Google Drive נכשלה.";
-          setRecordingMessage(`שמירת האודיו ל-Google Drive נכשלה, אבל ממשיכים להפיק דוח. לאחר מכן חבר Google Drive מחדש. ${message}`);
-        }
-      }
-
-      const completed = await processAudioDraft(
-        { ...sessionForProcessing, processingStatus: "processing" },
-        audio,
-        {
+      const processingOptions = {
           onUpdate: updateProcessingMessage,
-          onJobStarted: (jobId) => {
+          onJobStarted: (jobId: string) => {
             const processingSession: TherapySession = {
               ...sessionForProcessing,
               processingStatus: "processing",
@@ -1110,24 +1107,42 @@ function NewSessionView(props: {
             };
             props.onProcessingStarted(processingSession);
           }
+      };
+      let liveIds: string[] | null = null;
+      const livePlugin = window.Capacitor?.Plugins?.NativeRecorder;
+      if (liveManifestRef.current && livePlugin?.getLiveSegments) {
+        const until = Date.now() + 10 * 60 * 1000;
+        while (Date.now() < until) {
+          const info = await livePlugin.getLiveSegments({ path: liveManifestRef.current });
+          if (info.ready) { liveIds = info.segmentJobIds; break; }
+          const transfer = await nativeTransfer()?.status({ jobId: session.sessionId });
+          if (transfer?.state === "failed") break;
+          setRecordingMessage("משלים העלאה של מקטעי ההקלטה שנשמרו במכשיר...");
+          await new Promise((resolve) => setTimeout(resolve, 2000));
         }
-      );
-      let finalSession = completed;
-      if (storedAudioMeta) {
-        finalSession = {
-          ...completed,
-          ...storedAudioMeta,
-          updatedAt: new Date().toISOString()
-        };
       }
+      const completed = liveIds
+        ? await processLiveAudio(sessionForProcessing, liveIds, processingOptions)
+        : await processAudioDraft({ ...sessionForProcessing, processingStatus: "processing" }, audio, processingOptions);
+      let finalSession = completed;
       finalSession = {
         ...finalSession,
         processingJobId: undefined,
         processingStage: undefined,
         processingMessage: undefined
       };
-      await deletePendingAudio(sessionForProcessing.sessionId);
+      await deletePendingAudio(sessionForProcessing.sessionId).catch(() => undefined);
       props.onSaved(finalSession);
+      if (saveOriginalAudio && props.googleAccessToken) {
+        const audioFileName = buildAudioFileName(session, audio, file?.name);
+        // The report is already visible; a second upload must not delay it.
+        void uploadSessionAudioToDrive(props.googleAccessToken, finalSession, audio, audioFileName).then(() => {
+          props.onAudioSaved(finalSession.sessionId, { audioStored: true, audioFileName, audioMimeType: audio.type });
+        }).catch(async () => {
+          await savePendingAudio(session.sessionId, audio, {}).catch(() => undefined);
+          props.onAudioSaveFailed();
+        });
+      }
     } catch (error) {
       if (audio) {
         await savePendingAudio(sessionForProcessing.sessionId, audio, {

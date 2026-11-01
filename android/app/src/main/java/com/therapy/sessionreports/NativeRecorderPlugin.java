@@ -47,6 +47,7 @@ public class NativeRecorderPlugin extends Plugin {
     private void startRecordingService(PluginCall call) {
         Intent intent = new Intent(getContext(), ForegroundRecordingService.class);
         intent.setAction(ForegroundRecordingService.ACTION_START);
+        intent.putExtra("sessionId", call.getString("sessionId"));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getContext().startForegroundService(intent);
         } else {
@@ -80,9 +81,38 @@ public class NativeRecorderPlugin extends Plugin {
             result.put("mimeType", "audio/mp4");
             result.put("durationMs", startedAt > 0 ? System.currentTimeMillis() - startedAt : 0);
             result.put("sizeBytes", file.exists() ? file.length() : 0);
+            File manifest = ForegroundRecordingService.getLastLiveManifest();
+            if (manifest != null) {
+                result.put("liveManifest", manifest.getAbsolutePath());
+                result.put("sessionId", LiveRecordingManifest.read(manifest).getString("sessionId"));
+            }
             call.resolve(result);
         } catch (Exception error) {
             call.reject(error.getMessage());
         }
+    }
+
+    @PluginMethod
+    public void getLiveSegments(PluginCall call) {
+        try {
+            File manifest = new File(call.getString("path", "")).getCanonicalFile();
+            String root = new File(getContext().getExternalFilesDir(null), "recordings").getCanonicalPath() + File.separator;
+            if (!manifest.getPath().startsWith(root)) throw new IllegalArgumentException("Invalid recording path");
+            org.json.JSONObject data = LiveRecordingManifest.read(manifest);
+            org.json.JSONArray entries = data.getJSONArray("segments");
+            com.getcapacitor.JSArray ids = new com.getcapacitor.JSArray();
+            boolean ready = data.optBoolean("recordingComplete");
+            for (int i = 0; i < entries.length(); i++) {
+                org.json.JSONObject entry = entries.getJSONObject(i);
+                ready = ready && entry.optBoolean("uploaded");
+                if (entry.has("jobId")) ids.put(entry.getString("jobId"));
+            }
+            JSObject result = new JSObject();
+            result.put("ready", ready && entries.length() > 0);
+            result.put("segmentJobIds", ids);
+            result.put("sessionId", data.getString("sessionId"));
+            result.put("totalSegments", entries.length());
+            call.resolve(result);
+        } catch (Exception error) { call.reject("Live recording information unavailable"); }
     }
 }

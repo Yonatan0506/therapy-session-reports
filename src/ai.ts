@@ -1,10 +1,11 @@
 import type { TherapySession } from "./types";
 import { uploadRequest } from "./uploadRequest";
 import { clearUploadCheckpoint, readUploadCheckpoint, saveUploadCheckpoint, uploadCheckpointKey } from "./uploadCheckpoint";
+import { sendResumableAudio } from "./resumableUpload";
+import { nativeAudioPath, nativeTransfer, registerNativeAudio, transferInBackground } from "./nativeTransfer";
 
 const DEFAULT_REMOTE_API_BASE = "https://therapy-session-reports-82786531752.me-west1.run.app";
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
-const CHUNKED_UPLOAD_THRESHOLD_BYTES = 6 * 1024 * 1024;
 const AUDIO_UPLOAD_CHUNK_BYTES = 512 * 1024;
 
 export type ProcessingUpdate = {
@@ -39,8 +40,12 @@ export async function processAudioDraft(
 ): Promise<TherapySession> {
   const { onUpdate, onJobStarted } = normalizeProcessingOptions(options);
   const file = audioFile ? normalizeAudioFile(session, audioFile) : null;
-  if (file && file.size > CHUNKED_UPLOAD_THRESHOLD_BYTES) {
-    return processAudioDraftChunked(session, file, { onUpdate, onJobStarted });
+  if (file && audioFile) {
+    const path = nativeAudioPath(audioFile);
+    if (path) registerNativeAudio(file, path);
+  }
+  if (file && file.size > 0) {
+    return processAudioDirect(session, file, { onUpdate, onJobStarted });
   }
 
   const formData = new FormData();
@@ -75,6 +80,65 @@ export async function processAudioDraft(
 
   onJobStarted?.(payload.jobId);
   return pollProcessingJob(payload.jobId, onUpdate);
+}
+
+async function processAudioDirect(session: TherapySession, file: File, options: ProcessingOptions): Promise<TherapySession> {
+  const key = `${await uploadCheckpointKey(session.sessionId, file)}:direct`;
+  const cached = readUploadCheckpoint(key, 1);
+  let jobId = cached?.jobId || "";
+  let uploadUrl = "";
+  options.onUpdate?.({ phase: "warming", stage: "warming_server" });
+  if (jobId) {
+    const status = await uploadRequest(apiUrl(`/api/process-session-job/${jobId}`), { cache: "no-store" });
+    const payload = await status.json();
+    if (status.ok && payload.stage !== "uploading_audio") {
+      options.onJobStarted?.(jobId);
+      return pollProcessingJob(jobId, options.onUpdate);
+    }
+    if (payload.status === "failed" || status.status === 404) { clearUploadCheckpoint(key); jobId = ""; }
+    else {
+      const response = await uploadRequest(apiUrl(`/api/process-session-upload/${jobId}/resumable`), { cache: "no-store" });
+      if (!response.ok) throw new Error("לא ניתן לחדש את ההעלאה הקודמת.");
+      uploadUrl = (await response.json()).uploadUrl;
+    }
+  }
+  if (!jobId) {
+    const response = await uploadRequest(apiUrl("/api/process-session-upload"), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session, fileName: file.name, mimeType: file.type || "application/octet-stream", size: file.size, transport: "resumable" })
+    });
+    if (response.status === 409) return processAudioDraftChunked(session, file, options);
+    const payload = await response.json();
+    if (!response.ok || !payload.uploadUrl) throw new Error(payload.message || "לא ניתן להתחיל העלאה ישירה.");
+    jobId = payload.jobId;
+    uploadUrl = payload.uploadUrl;
+    saveUploadCheckpoint(key, jobId, 0);
+  }
+  options.onJobStarted?.(jobId);
+  const progress = (percent: number) => options.onUpdate?.({ phase: "uploading", stage: "uploading_audio", percent });
+  try {
+    if (nativeTransfer()) {
+      await transferInBackground(file, jobId, uploadUrl, new URL(apiUrl(`/api/process-session-upload/${jobId}/complete`), window.location.href).href, progress);
+    } else {
+      await sendResumableAudio(file, uploadUrl, progress);
+      const response = await uploadRequest(apiUrl(`/api/process-session-upload/${jobId}/complete`), { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      if (!response.ok) throw new Error((await response.json()).message || "לא ניתן לאשר את סיום ההעלאה.");
+    }
+  } catch (error) {
+    throw new Error(`העלאה ישירה נעצרה. אפשר לנסות שוב מאותה פגישה ולהמשיך מהמקום שנשמר. מזהה: ${jobId}. ${error instanceof Error ? error.message : ""}`);
+  }
+  clearUploadCheckpoint(key);
+  return pollProcessingJob(jobId, options.onUpdate);
+}
+
+export async function processLiveAudio(session: TherapySession, segmentJobIds: string[], options: ProcessingOptions = {}) {
+  const response = await uploadRequest(apiUrl("/api/process-live-report"), {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session, segmentJobIds })
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.message || "לא ניתן להפיק דוח ממקטעי ההקלטה.");
+  options.onJobStarted?.(payload.jobId);
+  return pollProcessingJob(payload.jobId, options.onUpdate);
 }
 
 async function processAudioDraftChunked(
