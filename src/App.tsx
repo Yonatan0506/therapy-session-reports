@@ -958,6 +958,7 @@ function NewSessionView(props: {
   const [recordingMessage, setRecordingMessage] = useState("");
   const [nativeRecording, setNativeRecording] = useState(false);
   const [saveOriginalAudio, setSaveOriginalAudio] = useState(false);
+  const [liveTranscription, setLiveTranscription] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
@@ -971,7 +972,7 @@ function NewSessionView(props: {
         const sessionId = uuid();
         recordingSessionIdRef.current = sessionId;
         liveManifestRef.current = null;
-        const result = await window.Capacitor!.Plugins!.NativeRecorder!.startRecording(nativeTransfer() ? { sessionId } : {});
+        const result = await window.Capacitor!.Plugins!.NativeRecorder!.startRecording(nativeTransfer() && liveTranscription ? { sessionId } : {});
         const startedAt = result.startedAt || Date.now();
         nativeStartedAtRef.current = startedAt;
         setRecordedBlob(null);
@@ -1181,6 +1182,10 @@ function NewSessionView(props: {
       </section>
       {props.mode === "recording" ? (
         <section className="recorder-panel">
+          {nativeTransfer() && <label className="checkbox-row">
+            <input type="checkbox" checked={liveTranscription} disabled={recording || isProcessing} onChange={(event) => setLiveTranscription(event.target.checked)} />
+            תמלול במהלך ההקלטה
+          </label>}
           <strong>{new Date(seconds * 1000).toISOString().slice(11, 19)}</strong>
           <div className="action-strip">
             {!recording && <button className="primary-button" onClick={startRecording}><Play /> התחל הקלטה</button>}
