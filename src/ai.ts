@@ -1,4 +1,5 @@
 import type { TherapySession } from "./types";
+import { uploadRequest } from "./uploadRequest";
 
 const DEFAULT_REMOTE_API_BASE = "https://therapy-session-reports-82786531752.me-west1.run.app";
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
@@ -81,10 +82,13 @@ async function processAudioDraftChunked(
   options: ProcessingOptions = {}
 ): Promise<TherapySession> {
   const { onUpdate, onJobStarted } = options;
+  let jobId = "";
+  let uploadStage = "בדיקת החיבור לשרת";
   try {
     onUpdate?.({ phase: "warming", stage: "warming_server" });
     await warmProcessingServer();
-    const startResponse = await fetch(apiUrl("/api/process-session-upload"), {
+    uploadStage = "פתיחת ההעלאה";
+    const startResponse = await uploadRequest(apiUrl("/api/process-session-upload"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -100,11 +104,12 @@ async function processAudioDraftChunked(
       throw new Error(startPayload?.message || startPayload?.error || "upload_start_failed");
     }
 
-    const jobId = String(startPayload.jobId);
+    jobId = String(startPayload.jobId);
     onJobStarted?.(jobId);
     let chunkIndex = 0;
     for (let offset = 0; offset < file.size; offset += AUDIO_UPLOAD_CHUNK_BYTES) {
       const chunk = file.slice(offset, Math.min(offset + AUDIO_UPLOAD_CHUNK_BYTES, file.size));
+      uploadStage = `העלאת מקטע ${chunkIndex + 1} מתוך ${Math.ceil(file.size / AUDIO_UPLOAD_CHUNK_BYTES)}`;
       await uploadAudioChunkWithRetry(jobId, chunk, chunkIndex);
       chunkIndex += 1;
       onUpdate?.({
@@ -114,7 +119,8 @@ async function processAudioDraftChunked(
       });
     }
 
-    const completeResponse = await fetch(apiUrl(`/api/process-session-upload/${encodeURIComponent(jobId)}/complete`), {
+    uploadStage = "אישור סיום ההעלאה";
+    const completeResponse = await uploadRequest(apiUrl(`/api/process-session-upload/${encodeURIComponent(jobId)}/complete`), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ totalChunks: chunkIndex })
@@ -124,11 +130,11 @@ async function processAudioDraftChunked(
       throw new Error(completePayload?.message || completePayload?.error || "upload_complete_failed");
     }
 
-    return pollProcessingJob(jobId, onUpdate);
   } catch (error) {
     const detail = error instanceof Error && error.message ? ` פרטים: ${error.message}` : "";
-    throw new Error(`לא הצלחנו להעלות את ההקלטה הארוכה לשרת העיבוד.${detail}`);
+    throw new Error(`העלאת ההקלטה לא הושלמה בשלב: ${uploadStage}.${jobId ? ` מזהה העלאה: ${jobId}.` : ""}${detail}`);
   }
+  return pollProcessingJob(jobId, onUpdate);
 }
 
 async function uploadAudioChunkWithRetry(jobId: string, chunk: Blob, index: number) {
@@ -137,13 +143,14 @@ async function uploadAudioChunkWithRetry(jobId: string, chunk: Blob, index: numb
     try {
       // מספר המקטע מאפשר לשרת לשמור כל מקטע בנפרד בענן, כך שאין תלות בכך שכל
       // המקטעים יגיעו לאותו instance, וניסיון חוזר על אותו מקטע פשוט דורס אותו.
-      const response = await fetch(
+      const response = await uploadRequest(
         apiUrl(`/api/process-session-upload/${encodeURIComponent(jobId)}/chunk?index=${index}`),
         {
           method: "POST",
           headers: { "Content-Type": "application/octet-stream", "x-chunk-index": String(index) },
           body: chunk
-        }
+        },
+        { attempts: 1 }
       );
       if (!response.ok) {
         const payload = await response.json().catch(() => null);
@@ -180,7 +187,7 @@ async function pollProcessingJob(jobId: string, onUpdate?: (update: ProcessingUp
     try {
       response = await fetch(apiUrl(`/api/process-session-job/${encodeURIComponent(jobId)}`), { cache: "no-store" });
       payload = await response.json().catch(() => null);
-      transientFailures = 0;
+      if (response.ok) transientFailures = 0;
       if (payload?.status && payload.status !== "completed") {
         onUpdate?.({ phase: "processing", stage: payload.stage || payload.status });
       }
@@ -225,17 +232,8 @@ function delay(ms: number) {
 }
 
 async function warmProcessingServer() {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 45000);
-  try {
-    const response = await fetch(apiUrl("/api/health"), {
-      cache: "no-store",
-      signal: controller.signal
-    });
-    if (!response.ok) throw new Error(`health ${response.status}`);
-  } finally {
-    window.clearTimeout(timeout);
-  }
+  const response = await uploadRequest(apiUrl("/api/health"), { cache: "no-store" }, { timeoutMs: 45000, attempts: 3 });
+  if (!response.ok) throw new Error(`health ${response.status}`);
 }
 
 function apiUrl(path: string) {

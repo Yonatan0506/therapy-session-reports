@@ -357,6 +357,11 @@ app.post(
 
 app.post("/api/process-session-upload/:jobId/complete", async (req, res) => {
   const jobId = req.params.jobId;
+  const existingJob = await getProcessingJob(jobId);
+  if (existingJob && (existingJob.status === "completed" || existingJob.status === "processing" || existingJob.stage === "upload_complete" || existingJob.stage === "queued_for_background_processing")) {
+    res.status(202).json({ jobId, status: existingJob.status });
+    return;
+  }
   const uploadJob = uploadJobs.get(jobId);
 
   if (!uploadJob && isCloudStorageConfigured()) {
@@ -369,6 +374,7 @@ app.post("/api/process-session-upload/:jobId/complete", async (req, res) => {
     // טוען את העבודה מהענן לזיכרון של ה-instance הנוכחי כדי שעדכוני הסטטוס יתפסו.
     await getProcessingJob(jobId);
     const expectedChunks = Number(req.body?.totalChunks || 0);
+    updateProcessingJob(jobId, { stage: "upload_complete" });
     res.status(202).json({ jobId, status: "queued" });
     void runCloudUploadedJobFromParts(jobId, meta, expectedChunks);
     return;
@@ -387,6 +393,7 @@ app.post("/api/process-session-upload/:jobId/complete", async (req, res) => {
     return;
   }
 
+  updateProcessingJob(jobId, { stage: "upload_complete" });
   res.status(202).json({ jobId: req.params.jobId, status: "queued" });
   if (isCloudStorageConfigured()) {
     void runCloudBackedUploadedProcessingJob(req.params.jobId);
