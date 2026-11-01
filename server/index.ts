@@ -9,6 +9,7 @@ import { existsSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { mapWithConcurrency } from "./parallel";
+import { transitionMetrics, type ProcessingMetrics } from "./processingMetrics";
 import {
   buildObjectName,
   composeObjects,
@@ -66,6 +67,7 @@ function temperatureOption(model: string, temperature: number) {
 }
 
 type ProcessingJob = {
+  metrics?: ProcessingMetrics;
   transcriptOnly?: boolean;
   segmentJobIds?: string[];
   status: "queued" | "processing" | "completed" | "failed";
@@ -411,7 +413,8 @@ app.post("/api/process-session-upload/:jobId/complete", async (req, res) => {
       }
       const now = new Date().toISOString();
       const job: ProcessingJob = {
-        status: "queued", stage: "queued_for_background_processing", createdAt: now, updatedAt: now,
+        status: "queued", stage: "queued_for_background_processing", createdAt: meta.createdAt, updatedAt: now,
+        metrics: { durations: { uploading_audio: Math.max(0, Date.now() - Date.parse(meta.createdAt)) }, stageStartedAt: now },
         session: meta.session, audioObjectName: meta.audioObjectName, originalname: meta.originalname,
         mimetype: meta.mimetype, size: meta.size, transcriptOnly: meta.transcriptOnly
       };
@@ -454,6 +457,7 @@ app.post("/api/process-session-upload/:jobId/complete", async (req, res) => {
 });
 
 app.get("/api/process-session-job/:jobId", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   const job = (await getProcessingJob(req.params.jobId)) || null;
   if (!job) {
     res.status(404).json({ error: "job_not_found", message: "עבודת העיבוד לא נמצאה. ייתכן שהשרת הופעל מחדש או שהעיבוד ישן מדי." });
@@ -471,11 +475,11 @@ app.get("/api/process-session-job/:jobId", async (req, res) => {
   }
 
   if (job.status === "failed") {
-    res.status(500).json({ status: job.status, error: "processing_failed", message: job.message || "עיבוד האודיו נכשל." });
+    res.status(500).json({ status: job.status, stage: job.stage, metrics: job.metrics, error: "processing_failed", message: job.message || "עיבוד האודיו נכשל." });
     return;
   }
 
-  res.json({ status: job.status, stage: job.stage, message: job.message });
+  res.json({ status: job.status, stage: job.stage, message: job.message, metrics: job.metrics });
 });
 
 app.post("/api/process-live-report", async (req, res) => {
@@ -530,7 +534,7 @@ async function runLiveReportJob(jobId: string) {
     }
     if (!transcripts.length) throw new Error("מקטעי ההקלטה טרם סיימו להתעבד. אפשר לנסות שוב מאוחר יותר.");
     updateProcessingJob(jobId, { stage: "summarizing_live_transcript" });
-    const result = await processSessionTranscript(job.session, transcripts.join("\n\n"));
+    const result = await processSessionTranscript(job.session, transcripts.join("\n\n"), jobId);
     await completeCloudJob(jobId, result);
   } catch (error) {
     updateProcessingJob(jobId, { status: "failed", message: getSafeErrorMessage(error) });
@@ -770,17 +774,19 @@ function buildDemoSession(session: any, now: string) {
   };
 }
 
-async function processSessionAudio(session: any, file: Express.Multer.File) {
-  return processSessionTranscript(session, await transcribeAudio(file));
+async function processSessionAudio(session: any, file: Express.Multer.File, jobId?: string) {
+  return processSessionTranscript(session, await transcribeAudio(file, jobId), jobId);
 }
 
-async function processSessionTranscript(session: any, transcript: string) {
+async function processSessionTranscript(session: any, transcript: string, jobId?: string) {
   const now = new Date().toISOString();
   const fallback = buildDemoSession(session, now);
   if (!hasMeaningfulTranscript(transcript)) {
     throw new Error("התמלול מהאודיו יצא ריק. ייתכן שהקובץ הוקלט בעוצמה נמוכה, שהמיקרופון נחסם, או שמודל התמלול לא הצליח לפענח את ההקלטה. מומלץ לבדוק שהאודיו נשמע ברור ולנסות שוב.");
   }
+  if (jobId) updateProcessingJob(jobId, { stage: "summarizing_report" });
   let aiReport = normalizeAiReport(await createTherapyReport(session, transcript), transcript);
+  if (jobId) updateProcessingJob(jobId, { stage: "refining_report" });
   if (!reportLooksHebrew(aiReport)) {
     aiReport = await refineReport(aiReport, "שכתוב לעברית", () => rewriteReportInHebrew(session, aiReport));
   }
@@ -993,7 +999,7 @@ async function runCloudProcessingJob(jobId: string) {
     const buffer = await downloadObject(job.audioObjectName);
     const file = buildCloudFile(job, buffer);
     updateProcessingJob(jobId, { status: "processing", stage: "transcribing_and_summarizing" });
-    const result = job.transcriptOnly ? { transcript: await transcribeAudio(file) } : await processSessionAudio(job.session, file);
+    const result = job.transcriptOnly ? { transcript: await transcribeAudio(file, jobId) } : await processSessionAudio(job.session, file, jobId);
     await completeCloudJob(jobId, result);
 
     if (process.env.DELETE_CLOUD_AUDIO_AFTER_SUCCESS !== "false") {
@@ -1015,17 +1021,19 @@ async function runCloudProcessingJob(jobId: string) {
 async function completeCloudJob(jobId: string, result: unknown) {
   const current = processingJobs.get(jobId);
   if (!current) throw new Error("Processing job missing");
-  const completed: ProcessingJob = { ...current, status: "completed", stage: "completed", result, updatedAt: new Date().toISOString() };
+  const metrics = transitionMetrics(current.metrics || { durations: {} }, current.stage, "completed");
+  const completed: ProcessingJob = { ...current, metrics, status: "completed", stage: "completed", result: { ...(result as object), processingMetrics: metrics }, updatedAt: new Date().toISOString() };
+  console.info("processing_timings", JSON.stringify({ jobId, durations: metrics.durations }));
   // Persist the result before removing its audio source.
-  await writeProcessingJob(jobId, completed);
+  if (isCloudStorageConfigured()) await writeProcessingJob(jobId, completed);
   processingJobs.set(jobId, completed);
 }
 
 async function runProcessingJob(jobId: string, session: any, file: Express.Multer.File) {
   updateProcessingJob(jobId, { status: "processing" });
   try {
-    const result = await processSessionAudio(session, file);
-    updateProcessingJob(jobId, { status: "completed", result });
+    const result = await processSessionAudio(session, file, jobId);
+    await completeCloudJob(jobId, result);
   } catch (error) {
     const message = getSafeErrorMessage(error);
     console.error("processing_job_failed", jobId, message);
@@ -1046,8 +1054,8 @@ async function runUploadedProcessingJob(jobId: string) {
   try {
     const buffer = await readFile(uploadJob.filePath);
     const file = buildUploadedFile(uploadJob, buffer);
-    const result = await processSessionAudio(uploadJob.session, file);
-    updateProcessingJob(jobId, { status: "completed", result });
+    const result = await processSessionAudio(uploadJob.session, file, jobId);
+    await completeCloudJob(jobId, result);
   } catch (error) {
     const message = getSafeErrorMessage(error);
     console.error("uploaded_processing_job_failed", jobId, message);
@@ -1065,6 +1073,7 @@ function updateProcessingJob(jobId: string, patch: Partial<ProcessingJob>) {
   const next = {
     ...current,
     ...patch,
+    metrics: patch.stage ? transitionMetrics(patch.metrics || current.metrics || { durations: {}, stageStartedAt: current.createdAt }, current.stage, patch.stage) : patch.metrics || current.metrics,
     updatedAt: new Date().toISOString()
   };
   processingJobs.set(jobId, next);
@@ -1160,8 +1169,9 @@ async function cleanupUploadJobDir(jobId: string) {
   }
 }
 
-async function transcribeAudio(file: Express.Multer.File) {
+async function transcribeAudio(file: Express.Multer.File, jobId?: string) {
   if (!openai) throw new Error("missing_openai_client");
+  if (jobId) updateProcessingJob(jobId, { stage: "transcribing_audio" });
 
   if (file.size <= DIRECT_TRANSCRIBE_LIMIT_BYTES && isDirectTranscriptionMime(file.mimetype)) {
     try {
@@ -1179,13 +1189,19 @@ async function transcribeAudio(file: Express.Multer.File) {
     }
   }
 
+  if (jobId) updateProcessingJob(jobId, { stage: "preparing_audio" });
   const chunks = await createAudioChunks(file);
+  if (jobId) updateProcessingJob(jobId, { stage: "transcribing_audio", metrics: { ...processingJobs.get(jobId)?.metrics, durations: processingJobs.get(jobId)?.metrics?.durations || {}, completedChunks: 0, totalChunks: chunks.length } });
   let transcripts: string[];
 
   try {
     transcripts = await mapWithConcurrency(chunks, getTranscriptionConcurrency(), async (chunk, index) => {
       const buffer = await readFile(chunk);
       const transcription = await transcribeBufferWithFallback(buffer, path.basename(chunk), "audio/mpeg", `תמלול מקטע ${index + 1}`);
+      if (jobId) {
+        const metrics = processingJobs.get(jobId)?.metrics;
+        updateProcessingJob(jobId, { metrics: { ...metrics, durations: metrics?.durations || {}, completedChunks: (metrics?.completedChunks || 0) + 1 } });
+      }
 
       const text = typeof transcription === "string" ? transcription : String(transcription);
       if (text.trim()) {

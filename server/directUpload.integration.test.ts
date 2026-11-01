@@ -77,7 +77,9 @@ test("direct upload verifies size, completes once, and joins live transcripts in
     assert.equal(transcriptions, 0);
     await globalThis.fetch(one.uploadUrl, { method: "PUT", body: new Uint8Array([1, 2, 3, 4]).buffer });
     assert.equal((await post(`/api/process-session-upload/${one.jobId}/complete`, {})).status, 202);
-    await finish(one.jobId);
+    const firstResult = await finish(one.jobId);
+    assert.ok(firstResult.result.processingMetrics.durations.uploading_audio >= 0);
+    assert.ok(firstResult.result.processingMetrics.durations.transcribing_audio >= 0);
     assert.equal((await post(`/api/process-session-upload/${one.jobId}/complete`, {})).status, 202);
     assert.equal(transcriptions, 1);
     const two = await start(true);
@@ -89,6 +91,8 @@ test("direct upload verifies size, completes once, and joins live transcripts in
     const parent = await (await post("/api/process-live-report", { session, segmentJobIds: [one.jobId, two.jobId] })).json() as { jobId: string };
     const result = await finish(parent.jobId);
     assert.equal(result.result.report.meetingTopic, "מפגש בדיקה");
+    assert.ok(result.result.processingMetrics.durations.summarizing_report >= 0);
+    assert.equal(result.result.processingMetrics.stageStartedAt.length, 24);
     assert.equal(transcriptions, 2, "final report must reuse existing transcripts");
   } finally {
     if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));

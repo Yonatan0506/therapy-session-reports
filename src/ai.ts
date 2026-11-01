@@ -9,6 +9,7 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.
 const AUDIO_UPLOAD_CHUNK_BYTES = 512 * 1024;
 
 export type ProcessingUpdate = {
+  metrics?: TherapySession["processingMetrics"];
   phase: "warming" | "uploading" | "processing";
   percent?: number;
   stage?: string;
@@ -283,7 +284,7 @@ async function pollProcessingJob(jobId: string, onUpdate?: (update: ProcessingUp
       payload = await response.json().catch(() => null);
       if (response.ok) transientFailures = 0;
       if (payload?.status && payload.status !== "completed") {
-        onUpdate?.({ phase: "processing", stage: payload.stage || payload.status });
+        onUpdate?.({ phase: "processing", stage: payload.stage || payload.status, metrics: payload.metrics });
       }
     } catch (error) {
       transientFailures += 1;

@@ -34,6 +34,7 @@ export interface InternalSessionMemory {
 }
 
 export interface TherapySession {
+  processingMetrics?: { durations: Record<string, number>; stageStartedAt?: string; completedChunks?: number; totalChunks?: number };
   sessionId: string;
   ownerUserId: string;
   patientId: string;

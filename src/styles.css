@@ -503,3 +503,7 @@ textarea {
     width: 100%;
   }
 }
+.processing-progress { display: grid; gap: 8px; padding-block: 12px; overflow-wrap: anywhere; }
+.processing-durations { display: flex; flex-wrap: wrap; gap: 12px 24px; margin: 0; }
+.processing-durations div { display: grid; gap: 4px; }
+.processing-durations dd { margin: 0; font-variant-numeric: tabular-nums; }

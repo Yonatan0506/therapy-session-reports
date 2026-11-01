@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlignmentType,
   Document,
@@ -245,6 +245,7 @@ export function App() {
           processingStatus: "processing",
           processingStage: stage,
           processingMessage: processingStageMessage(stage),
+          processingMetrics: update.metrics || session.processingMetrics,
           updatedAt: new Date().toISOString()
         });
       });
@@ -772,6 +773,13 @@ function SessionList(props: { title: string; sessions: TherapySession[]; onOpen:
 
 function processingStageMessage(stage: string) {
   const labels: Record<string, string> = {
+    uploading_audio: "מעלה את ההקלטה",
+    preparing_audio: "מכין את מקטעי האודיו",
+    transcribing_audio: "מתמלל את ההקלטה",
+    summarizing_report: "מפיק דוח טיפולי",
+    refining_report: "בודק ומעמיק את הדוח",
+    waiting_for_live_segments: "ממתין להשלמת מקטעי ההקלטה החיה",
+    summarizing_live_transcript: "מכין את התמלול לדוח",
     queued: "הדוח ממתין לעיבוד.",
     pending: "הדוח ממתין לעיבוד.",
     audio_received: "האודיו התקבל בשרת.",
@@ -784,6 +792,29 @@ function processingStageMessage(stage: string) {
     failed: "העיבוד נכשל ודורש ניסיון חוזר או בדיקה."
   };
   return labels[stage] || "העיבוד עדיין מתבצע.";
+}
+
+function ProcessingProgress({ update }: { update?: ProcessingUpdate }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const metrics = update?.metrics;
+  const stage = update?.stage || (update?.phase === "uploading" ? "uploading_audio" : "processing");
+  const labels: Record<string, string> = {
+    uploading_audio: "העלאה", queued_for_background_processing: "המתנה לעיבוד",
+    downloading_audio_from_cloud: "טעינה מהענן", preparing_audio: "הכנת אודיו",
+    transcribing_audio: "תמלול", summarizing_report: "הפקת דוח", refining_report: "בדיקת הדוח",
+    waiting_for_live_segments: "השלמת התמלול החי"
+  };
+  const elapsed = metrics?.stageStartedAt ? Math.max(0, now - Date.parse(metrics.stageStartedAt)) : 0;
+  return <div className="processing-progress" role="status" aria-live="polite">
+    <strong>{processingStageMessage(stage)}{update?.phase === "uploading" && update.percent !== undefined ? ` (${update.percent}%)` : ""}</strong>
+    {stage !== "completed" && elapsed > 0 && <span>זמן בשלב הנוכחי: {formatDuration(Math.floor(elapsed / 1000))}</span>}
+    {stage === "transcribing_audio" && metrics?.totalChunks && <span>מקטעי תמלול שהושלמו: {metrics.completedChunks || 0} מתוך {metrics.totalChunks}</span>}
+    {metrics && <dl className="processing-durations">{Object.entries(metrics.durations).filter(([key]) => labels[key]).map(([key, ms]) => <div key={key}><dt>{labels[key]}</dt><dd>{formatDuration(Math.floor(ms / 1000))}</dd></div>)}</dl>}
+  </div>;
 }
 
 function statusLabel(status: TherapySession["processingStatus"]) {
@@ -953,6 +984,7 @@ function NewSessionView(props: {
   const [file, setFile] = useState<File | null>(null);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingUpdate, setProcessingUpdate] = useState<ProcessingUpdate>();
   const [recording, setRecording] = useState(false);
   const [seconds, setSeconds] = useState(0);
   const [recordingMessage, setRecordingMessage] = useState("");
@@ -1047,6 +1079,7 @@ function NewSessionView(props: {
   }
 
   function updateProcessingMessage(update: ProcessingUpdate) {
+    setProcessingUpdate(update);
     if (update.phase === "warming") {
       setRecordingMessage("מכין את שרת העיבוד...");
       return;
@@ -1066,7 +1099,7 @@ function NewSessionView(props: {
       processing: "מעבד את ההקלטה.",
       completed: "העיבוד הושלם."
     };
-    setRecordingMessage(labels[update.stage || ""] || "מעבד את ההקלטה. אפשר להמתין עד שהדוח ייפתח.");
+    setRecordingMessage(labels[update.stage || ""] || processingStageMessage(update.stage || "processing"));
   }
 
   async function process() {
@@ -1224,6 +1257,7 @@ function NewSessionView(props: {
         <FileText />
         {isProcessing ? "מעבד..." : "הפק דו״ח"}
       </button>
+      {isProcessing && <ProcessingProgress update={processingUpdate} />}
     </section>
   );
 }
@@ -1409,6 +1443,7 @@ function SessionView(props: {
       ...current,
       processingStatus: "processing",
       processingStage: stage,
+      processingMetrics: update.metrics || current.processingMetrics,
       processingMessage: message,
       updatedAt: new Date().toISOString()
     }));
@@ -1449,6 +1484,7 @@ function SessionView(props: {
       </div>
       <section className="report-editor">
         <h2>{reportLabels.title}</h2>
+        {draft.processingMetrics && <ProcessingProgress update={{ phase: "processing", stage: draft.processingStatus === "completed" ? "completed" : draft.processingStage, metrics: draft.processingMetrics }} />}
         {draft.processingStatus === "failed" && (
           <p className="warning">{draft.report.administrativeNotes || "לא הצלחנו להפיק דו״ח. אפשר לנסות שוב."}</p>
         )}
