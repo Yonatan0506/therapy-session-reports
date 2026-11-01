@@ -1,10 +1,11 @@
 import type { TherapySession } from "./types";
 import { uploadRequest } from "./uploadRequest";
+import { clearUploadCheckpoint, readUploadCheckpoint, saveUploadCheckpoint, uploadCheckpointKey } from "./uploadCheckpoint";
 
 const DEFAULT_REMOTE_API_BASE = "https://therapy-session-reports-82786531752.me-west1.run.app";
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
 const CHUNKED_UPLOAD_THRESHOLD_BYTES = 6 * 1024 * 1024;
-const AUDIO_UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
+const AUDIO_UPLOAD_CHUNK_BYTES = 512 * 1024;
 
 export type ProcessingUpdate = {
   phase: "warming" | "uploading" | "processing";
@@ -84,9 +85,32 @@ async function processAudioDraftChunked(
   const { onUpdate, onJobStarted } = options;
   let jobId = "";
   let uploadStage = "בדיקת החיבור לשרת";
+  const totalChunks = Math.ceil(file.size / AUDIO_UPLOAD_CHUNK_BYTES);
+  const checkpointKey = await uploadCheckpointKey(session.sessionId, file);
+  let chunkIndex = 0;
+  let resumable = false;
   try {
     onUpdate?.({ phase: "warming", stage: "warming_server" });
     await warmProcessingServer();
+    const checkpoint = readUploadCheckpoint(checkpointKey, totalChunks);
+    if (checkpoint) {
+      const statusResponse = await uploadRequest(apiUrl(`/api/process-session-job/${encodeURIComponent(checkpoint.jobId)}`), { cache: "no-store" });
+      const status = await statusResponse.json().catch(() => null);
+      if (statusResponse.ok && status?.stage === "uploading_audio") {
+        jobId = checkpoint.jobId;
+        chunkIndex = checkpoint.nextChunk;
+        resumable = true;
+      } else if (statusResponse.ok && status?.status !== "failed") {
+        clearUploadCheckpoint(checkpointKey);
+        onJobStarted?.(checkpoint.jobId);
+        return pollProcessingJob(checkpoint.jobId, onUpdate);
+      } else if (statusResponse.status === 404 || status?.status === "failed") {
+        clearUploadCheckpoint(checkpointKey);
+      } else {
+        throw new Error("לא ניתן לבדוק את מצב ההעלאה הקודמת. נסה שוב לאחר חזרת החיבור.");
+      }
+    }
+    if (!jobId) {
     uploadStage = "פתיחת ההעלאה";
     const startResponse = await uploadRequest(apiUrl("/api/process-session-upload"), {
       method: "POST",
@@ -105,13 +129,16 @@ async function processAudioDraftChunked(
     }
 
     jobId = String(startPayload.jobId);
+    resumable = startPayload.storage === "cloud";
+    if (resumable) saveUploadCheckpoint(checkpointKey, jobId, 0);
+    }
     onJobStarted?.(jobId);
-    let chunkIndex = 0;
-    for (let offset = 0; offset < file.size; offset += AUDIO_UPLOAD_CHUNK_BYTES) {
+    for (let offset = chunkIndex * AUDIO_UPLOAD_CHUNK_BYTES; offset < file.size; offset += AUDIO_UPLOAD_CHUNK_BYTES) {
       const chunk = file.slice(offset, Math.min(offset + AUDIO_UPLOAD_CHUNK_BYTES, file.size));
       uploadStage = `העלאת מקטע ${chunkIndex + 1} מתוך ${Math.ceil(file.size / AUDIO_UPLOAD_CHUNK_BYTES)}`;
       await uploadAudioChunkWithRetry(jobId, chunk, chunkIndex);
       chunkIndex += 1;
+      if (resumable) saveUploadCheckpoint(checkpointKey, jobId, chunkIndex);
       onUpdate?.({
         phase: "uploading",
         percent: Math.min(100, Math.round((Math.min(offset + AUDIO_UPLOAD_CHUNK_BYTES, file.size) / file.size) * 100)),
@@ -129,6 +156,7 @@ async function processAudioDraftChunked(
     if (!completeResponse.ok) {
       throw new Error(completePayload?.message || completePayload?.error || "upload_complete_failed");
     }
+    clearUploadCheckpoint(checkpointKey);
 
   } catch (error) {
     const detail = error instanceof Error && error.message ? ` פרטים: ${error.message}` : "";
@@ -138,6 +166,8 @@ async function processAudioDraftChunked(
 }
 
 async function uploadAudioChunkWithRetry(jobId: string, chunk: Blob, index: number) {
+  // Materialize only this small slice; WebView need not stream a large file-backed Blob.
+  const bytes = await chunk.arrayBuffer();
   let lastError: unknown;
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     try {
@@ -148,7 +178,7 @@ async function uploadAudioChunkWithRetry(jobId: string, chunk: Blob, index: numb
         {
           method: "POST",
           headers: { "Content-Type": "application/octet-stream", "x-chunk-index": String(index) },
-          body: chunk
+          body: bytes
         },
         { attempts: 1 }
       );

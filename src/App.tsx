@@ -51,7 +51,7 @@ import {
   uploadSessionAudioToDrive,
   uploadSessionDocxToDrive
 } from "./googleDrive";
-import { deletePendingAudio, savePendingAudio } from "./offlineAudio";
+import { deletePendingAudio, getPendingAudio, savePendingAudio } from "./offlineAudio";
 import { storage } from "./storage";
 import type { Patient, SessionReport, TherapySession } from "./types";
 
@@ -1289,6 +1289,46 @@ function SessionView(props: {
   const [statusMessage, setStatusMessage] = useState("");
   const [actionFeedback, setActionFeedback] = useState<"save" | "share" | "crm" | "word" | "">("");
   const [isCheckingJob, setIsCheckingJob] = useState(false);
+  const [isRetryingAudio, setIsRetryingAudio] = useState(false);
+  const [needsRetryFile, setNeedsRetryFile] = useState(false);
+
+  async function retryAudio(replacement?: File) {
+    if (isRetryingAudio) return;
+    setIsRetryingAudio(true);
+    setStatusMessage("בודק את ההקלטה השמורה...");
+    let retrySession = draft;
+    try {
+      const audio = replacement || await getPendingAudio(draft.sessionId);
+      if (!audio) {
+        setNeedsRetryFile(true);
+        setStatusMessage("ההקלטה הזמנית לא נמצאה במכשיר הזה. בחר את קובץ האודיו המקורי לניסיון חוזר.");
+        return;
+      }
+      await savePendingAudio(draft.sessionId, audio, {});
+      const completed = await processAudioDraft(draft, audio, {
+        onUpdate: updateJobMessage,
+        onJobStarted: (jobId) => {
+          retrySession = { ...draft, processingJobId: jobId, processingStatus: "processing" };
+          setDraft(retrySession);
+          props.onSave(retrySession);
+        }
+      });
+      const saved = { ...completed, processingJobId: undefined, processingStage: undefined, processingMessage: undefined };
+      setDraft(saved);
+      props.onSave(saved);
+      await deletePendingAudio(draft.sessionId).catch(() => console.warn("pending_audio_cleanup_failed"));
+      setStatusMessage("הדוח הופק ונשמר.");
+      setNeedsRetryFile(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "הניסיון החוזר נכשל.";
+      const failed = buildFailedSession(retrySession, message, "failed");
+      setDraft(failed);
+      props.onSave(failed);
+      setStatusMessage(message);
+    } finally {
+      setIsRetryingAudio(false);
+    }
+  }
 
   function updateReport(key: keyof SessionReport, value: string | string[]) {
     setDraft({ ...draft, report: { ...draft.report, [key]: value }, updatedAt: new Date().toISOString() });
@@ -1391,6 +1431,14 @@ function SessionView(props: {
         <h2>{reportLabels.title}</h2>
         {draft.processingStatus === "failed" && (
           <p className="warning">{draft.report.administrativeNotes || "לא הצלחנו להפיק דו״ח. אפשר לנסות שוב."}</p>
+        )}
+        {(draft.processingStatus === "failed" || isRetryingAudio || needsRetryFile) && (
+          <div className="action-strip">
+            <button className="secondary-button" disabled={isRetryingAudio} onClick={() => retryAudio()}>
+              <RefreshCw /> {isRetryingAudio ? "מנסה שוב..." : "נסה שוב מההקלטה השמורה"}
+            </button>
+            {needsRetryFile && <input aria-label="קובץ אודיו לניסיון חוזר" type="file" accept="audio/*" disabled={isRetryingAudio} onChange={(event) => { const file = event.target.files?.[0]; if (file) void retryAudio(file); }} />}
+          </div>
         )}
         {draft.processingStatus === "processing" && draft.processingJobId && (
           <div className="warning">

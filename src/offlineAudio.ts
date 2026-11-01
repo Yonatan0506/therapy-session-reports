@@ -41,3 +41,16 @@ export async function deletePendingAudio(sessionId: string) {
   });
   db.close();
 }
+
+export async function getPendingAudio(sessionId: string): Promise<Blob | null> {
+  const db = await openDb();
+  try {
+    return await new Promise<Blob | null>((resolve, reject) => {
+      const request = db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(sessionId);
+      request.onsuccess = () => resolve(request.result?.audio instanceof Blob ? request.result.audio : null);
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+}
