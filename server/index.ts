@@ -628,7 +628,7 @@ app.post("/api/chat-session", async (req, res) => {
                     sessionDate: session.sessionDate,
                     participants: session.participants
                   },
-                  previousSessions: req.body?.previousSessions || []
+                  previousSessions: (req.body?.previousSessions || []).map(({ transcript: _transcript, ...previous }: any) => previous)
                 },
                 null,
                 2
@@ -801,6 +801,7 @@ async function processSessionTranscript(session: any, transcript: string, jobId?
     ...session,
     processingStatus: "completed",
     audioStored: Boolean(session.audioStored),
+    transcript: session.saveTranscript === true ? transcript : undefined,
     audioFileName: session.audioFileName,
     audioMimeType: session.audioMimeType,
     report: {

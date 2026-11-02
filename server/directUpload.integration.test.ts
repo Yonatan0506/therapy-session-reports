@@ -58,8 +58,8 @@ test("direct upload verifies size, completes once, and joins live transcripts in
     const base = `http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`;
     const post = (route: string, value: unknown) => originalFetch(base + route, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
     const session = { sessionId: "test-session", patientDisplayName: "בדיקה", sessionType: "טיפול" };
-    const start = async (transcriptOnly: boolean) => {
-      const response = await post("/api/process-session-upload", { session, fileName: "test.m4a", mimeType: "audio/mp4", size: 4, transport: "resumable", transcriptOnly });
+    const start = async (transcriptOnly: boolean, saveTranscript = false) => {
+      const response = await post("/api/process-session-upload", { session: { ...session, saveTranscript }, fileName: "test.m4a", mimeType: "audio/mp4", size: 4, transport: "resumable", transcriptOnly });
       assert.equal(response.status, 202);
       return response.json() as Promise<{ jobId: string; uploadUrl: string }>;
     };
@@ -91,9 +91,22 @@ test("direct upload verifies size, completes once, and joins live transcripts in
     const parent = await (await post("/api/process-live-report", { session, segmentJobIds: [one.jobId, two.jobId] })).json() as { jobId: string };
     const result = await finish(parent.jobId);
     assert.equal(result.result.report.meetingTopic, "מפגש בדיקה");
+    assert.equal(result.result.transcript, undefined, "transcript retention must be opt-in");
     assert.ok(result.result.processingMetrics.durations.summarizing_report >= 0);
     assert.equal(result.result.processingMetrics.stageStartedAt.length, 24);
     assert.equal(transcriptions, 2, "final report must reuse existing transcripts");
+    const retained = await start(false);
+    await globalThis.fetch(retained.uploadUrl, { method: "PUT", body: new Uint8Array([1, 2, 3, 4]).buffer });
+    await post(`/api/process-session-upload/${retained.jobId}/complete`, {});
+    const withoutRetention = await finish(retained.jobId);
+    assert.equal(withoutRetention.result.transcript, undefined);
+    const withRetention = await start(false, true);
+    await globalThis.fetch(withRetention.uploadUrl, { method: "PUT", body: new Uint8Array([1, 2, 3, 4]).buffer });
+    await post(`/api/process-session-upload/${withRetention.jobId}/complete`, {});
+    const retainedResult = await finish(withRetention.jobId);
+    assert.ok(retainedResult.result.transcript.includes("תמלול בדיקה בעברית"));
+    assert.deepEqual(retainedResult.result.report, withoutRetention.result.report);
+    assert.equal(transcriptions, 4, "retention must not trigger an additional transcription");
   } finally {
     if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
     globalThis.fetch = originalFetch;

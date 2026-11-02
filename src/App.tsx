@@ -990,6 +990,7 @@ function NewSessionView(props: {
   const [recordingMessage, setRecordingMessage] = useState("");
   const [nativeRecording, setNativeRecording] = useState(false);
   const [saveOriginalAudio, setSaveOriginalAudio] = useState(false);
+  const [saveTranscript, setSaveTranscript] = useState(false);
   const [liveTranscription, setLiveTranscription] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -1125,6 +1126,7 @@ function NewSessionView(props: {
       sessionType
     });
     if (recordingSessionIdRef.current && props.mode === "recording") session.sessionId = recordingSessionIdRef.current;
+    session.saveTranscript = saveTranscript;
     let sessionForProcessing = session;
     setIsProcessing(true);
     try {
@@ -1253,6 +1255,11 @@ function NewSessionView(props: {
       {saveOriginalAudio && (
         <p className="warning">שים לב: שמירת אודיו מגדילה משמעותית את רגישות המידע ואת נפח האחסון ב-Drive.</p>
       )}
+      <label className="checkbox-row">
+        <input type="checkbox" checked={saveTranscript} disabled={isProcessing} onChange={(event) => setSaveTranscript(event.target.checked)} />
+        שמור גם תמלול מלא עם הפגישה
+      </label>
+      {saveTranscript && <p className="warning">התמלול מכיל מידע טיפולי רגיש ויישמר עם הפגישה במכשיר ובסנכרון ל־Drive, אם מחובר.</p>}
       <button className="primary-button" disabled={isProcessing || recording || !patientName.trim() || !(file || recordedBlob)} onClick={process}>
         <FileText />
         {isProcessing ? "מעבד..." : "הפק דו״ח"}
@@ -1549,6 +1556,27 @@ function SessionView(props: {
         <button className="danger-button" onClick={props.onDelete}><Trash2 /> מחק פגישה</button>
       </div>
       <section className="chat-panel">
+        {draft.transcript && <details className="transcript-section">
+          <summary>תמלול מלא</summary>
+          <textarea aria-label="תמלול מלא" className="transcript-text" value={draft.transcript} readOnly />
+          <div className="action-strip">
+            <button className="secondary-button" onClick={async () => {
+              try { await navigator.clipboard.writeText(draft.transcript || ""); setStatusMessage("התמלול המלא הועתק ללוח."); }
+              catch { setStatusMessage("ההעתקה לא הצליחה. אפשר לבחור ולהעתיק את הטקסט מתוך התמלול."); }
+            }}><ClipboardCopy /> העתק תמלול</button>
+            <button className="secondary-button" onClick={() => {
+              downloadBlob(new Blob(["\uFEFF", draft.transcript || ""], { type: "text/plain;charset=utf-8" }), `transcript_${draft.sessionDate}_${draft.sessionId}.txt`);
+              setStatusMessage("קובץ התמלול נשלח להורדה.");
+            }}><Save /> הורד תמלול</button>
+            <button className="danger-button" onClick={() => {
+              if (!window.confirm("למחוק את התמלול מהפגישה? הדוח יישאר ללא שינוי. עותקים שכבר הורדו לא יימחקו.")) return;
+              const next = { ...draft, transcript: undefined, saveTranscript: false, updatedAt: new Date().toISOString() };
+              setDraft(next);
+              props.onSave(next);
+              setStatusMessage("התמלול הוסר מהפגישה במכשיר. אם Drive מחובר, השינוי יסונכרן אליו. עותקי עיבוד זמניים בשרת אינם נמחקים בפעולה זו.");
+            }}><Trash2 /> מחק תמלול</button>
+          </div>
+        </details>}
         <h2>שיחה עם הפגישה</h2>
         <textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="שאל שאלה על הפגישה או על רצף הפגישות" />
         <div className="action-strip">

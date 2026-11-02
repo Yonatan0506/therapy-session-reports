@@ -507,3 +507,5 @@ textarea {
 .processing-durations { display: flex; flex-wrap: wrap; gap: 12px 24px; margin: 0; }
 .processing-durations div { display: grid; gap: 4px; }
 .processing-durations dd { margin: 0; font-variant-numeric: tabular-nums; }
+.transcript-section summary { cursor: pointer; font-weight: 600; padding-block: 12px; }
+.transcript-text { min-height: 320px; max-height: 65vh; width: 100%; white-space: pre-wrap; line-height: 1.8; resize: vertical; }
